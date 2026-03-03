@@ -1,20 +1,20 @@
 {
-  "name": "git-scrub",
+  "name": "git-vanish",
   "version": "1.0.0",
-  "description": "Interactively browse your repo and permanently remove sensitive files from all git commit history — without losing your other commits. File data is preserved on disk as untracked.",
+  "description": "Interactively browse your repo and permanently vanish sensitive files from all git commit history — secrets gone from every commit, file preserved on disk as untracked.",
   "bin": {
-    "git-scrub": "./bin/git-scrub.js"
+    "git-vanish": "./bin/git-vanish.js"
   },
   "main": "./src/index.js",
-  "scripts": {
-    "start": "node bin/git-scrub.js"
-  },
   "files": [
     "bin/",
     "src/",
     "README.md",
     "LICENSE"
   ],
+  "scripts": {
+    "start": "node bin/git-vanish.js"
+  },
   "keywords": [
     "git",
     "history",
@@ -31,17 +31,18 @@
     "security",
     "leaked",
     "api-key",
-    "password"
+    "password",
+    "vanish"
   ],
   "author": "zamansheikh",
   "license": "MIT",
   "repository": {
     "type": "git",
-    "url": "https://github.com/zamansheikh/git-scrub.git"
+    "url": "https://github.com/zamansheikh/git-vanish.git"
   },
-  "homepage": "https://github.com/zamansheikh/git-scrub#readme",
+  "homepage": "https://github.com/zamansheikh/git-vanish#readme",
   "bugs": {
-    "url": "https://github.com/zamansheikh/git-scrub/issues"
+    "url": "https://github.com/zamansheikh/git-vanish/issues"
   },
   "dependencies": {
     "chalk": "^4.1.2",

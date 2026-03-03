@@ -1,7 +1,7 @@
 'use strict';
 
 /**
- * git-scrub – main orchestrator
+ * git-vanish – main orchestrator
  *
  * Flow:
  *  1. Locate git repo root (from cwd or --repo flag)
@@ -26,11 +26,11 @@ const { scrubFile } = require('./git/rewrite');
 /* ─── CLI setup ──────────────────────────────────────────── */
 
 program
-  .name('git-scrub')
+  .name('git-vanish')
   .version('1.0.0')
   .description(
-    'Interactively browse your repo and permanently erase a sensitive\n' +
-    'file from all git commit history — without losing other commits.'
+    'Interactively browse your repo and permanently vanish a sensitive\n' +
+    'file from all git commit history — file preserved on disk as untracked.'
   )
   .option('-r, --repo <path>',  'Path to the git repository (default: cwd)')
   .option('-f, --file <path>',  'Repo-relative file path to scrub (skip the browser)')
@@ -55,7 +55,7 @@ async function findRepoRoot(startPath) {
 function printBanner() {
   const W = process.stdout.columns || 80;
   console.log(chalk.bold.red('\n' + '═'.repeat(W)));
-  console.log(chalk.bold.red('  🔥 git-scrub') + chalk.bold.white(' — Scrub sensitive files from git history'));
+  console.log(chalk.bold.red('  🔥 git-vanish') + chalk.bold.white(' — Vanish sensitive files from git history'));
   console.log(chalk.bold.red('═'.repeat(W)) + '\n');
 }
 
@@ -140,7 +140,7 @@ async function main() {
       const browser = new FileBrowser({
         root:      repoPath,
         gitFiles:  allTrackedFiles,
-        title:     '  git-scrub — Select file to erase from history',
+        title:     '  git-vanish — Select file to vanish from history',
         onSelect:  (rel) => resolve(rel),
         onCancel:  () => reject(new Error('cancelled')),
       });
@@ -212,7 +212,7 @@ async function main() {
     spinner.fail(chalk.red('Scrub failed.'));
     console.error('\n' + chalk.red(err.message) + '\n');
     console.error(chalk.gray(
-      ' Tip: Make sure you have no uncommitted changes before running git-scrub.\n' +
+      ' Tip: Make sure you have no uncommitted changes before running git-vanish.\n' +
       ' Run: git stash  then try again.\n'
     ));
     process.exit(1);

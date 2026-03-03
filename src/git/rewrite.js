@@ -75,7 +75,7 @@ function saveContent(repoPath, filePath, onProgress) {
   const stat = fs.statSync(fullPath);
 
   if (stat.isDirectory()) {
-    const tmpDest = path.join(os.tmpdir(), `git-scrub-${Date.now()}-${path.basename(fullPath)}`);
+    const tmpDest = path.join(os.tmpdir(), `git-vanish-${Date.now()}-${path.basename(fullPath)}`);
     onProgress(chalk.gray(`  Saving directory copy → ${tmpDest}`));
     copyDirSync(fullPath, tmpDest);
     return { type: 'dir', tmp: tmpDest, dest: fullPath };
@@ -142,7 +142,7 @@ function addToGitignore(repoPath, filePath) {
     if (checked.some((v) => lines.includes(v))) return false;
   }
 
-  const newEntry = `\n# Added by git-scrub — removed from history\n${gitPath}\n`;
+  const newEntry = `\n# Added by git-vanish — removed from history\n${gitPath}\n`;
   fs.writeFileSync(ignorePath, existing + newEntry, 'utf8');
   return true;
 }
@@ -209,7 +209,7 @@ async function scrubFile(repoPath, filePath, onProgress = console.log) {
   if (added) {
     onProgress(chalk.gray(`  Committing .gitignore update…`));
     run('git add .gitignore', repoPath, { silent: true, failOk: true });
-    run('git commit -m "chore: add ' + filePath.replace(/"/g, '\\"') + ' to .gitignore [git-scrub]"', repoPath, { silent: true, failOk: true });
+    run('git commit -m "chore: add ' + filePath.replace(/"/g, '\\"') + ' to .gitignore [git-vanish]"', repoPath, { silent: true, failOk: true });
   }
 
   // 2. Save working-tree content WITHOUT touching the git index
