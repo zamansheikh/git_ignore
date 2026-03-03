@@ -126,26 +126,105 @@ function addToGitignore(repoPath, filePath) {
   return true;
 }
 
+/* ─── working tree backup / restore ───────────────────────── */
+
+/**
+ * Preserve the current working-tree copy of the target BEFORE git rewrites
+ * history (which will delete the file/directory from the working tree as it
+ * checks out the new HEAD that no longer contains the path).
+ *
+ * Strategy:
+ *  • Directory → rename to <path>.git-scrub-bak  (instant, zero extra disk)
+ *  • File      → rename to <path>.git-scrub-bak
+ *
+ * Returns the backup path, or null if nothing existed on disk.
+ */
+function backupWorkingTree(fullPath, onProgress) {
+  if (!fs.existsSync(fullPath)) return null;
+
+  const backupPath = fullPath.replace(/\\/g, '/').replace(/\/$/, '') + '.git-scrub-bak';
+
+  // Remove stale backup if one exists from a previous failed run
+  if (fs.existsSync(backupPath)) {
+    try { fs.rmSync(backupPath, { recursive: true, force: true }); } catch {}
+  }
+
+  fs.renameSync(fullPath, backupPath);
+  onProgress(chalk.gray(`  Working-tree copy saved → ${path.basename(backupPath)}`));
+  return backupPath;
+}
+
+/**
+ * After history rewrite, move the backup back to the original path.
+ * The file becomes untracked (because .gitignore now lists it).
+ */
+function restoreWorkingTree(backupPath, fullPath, onProgress) {
+  if (!fs.existsSync(backupPath)) return;
+
+  // If git somehow put an empty placeholder there, remove it first
+  if (fs.existsSync(fullPath)) {
+    try { fs.rmSync(fullPath, { recursive: true, force: true }); } catch {}
+  }
+
+  // Ensure parent directory exists
+  const parent = path.dirname(fullPath);
+  if (!fs.existsSync(parent)) fs.mkdirSync(parent, { recursive: true });
+
+  fs.renameSync(backupPath, fullPath);
+  onProgress(chalk.gray(`  Working-tree copy restored → ${path.basename(fullPath)}`));
+}
+
 /* ─── main export ──────────────────────────────────────────── */
 
 /**
- * Remove a file from ALL git history.
+ * Remove a file/directory from ALL git history while preserving the current
+ * working-tree copy as an untracked file.
+ *
+ * Flow:
+ *  1. Add path to .gitignore (so after restore git won't re-track it)
+ *  2. Rename file/dir to a temp backup name (instant — no copying)
+ *  3. Rewrite history (filter-repo or filter-branch)
+ *  4. Clean up reflogs + run gc
+ *  5. Rename backup back to original — file is now untracked, data preserved
  *
  * @param {string}   repoPath   – absolute path to git repo root
  * @param {string}   filePath   – repo-relative path (e.g. "config/secrets.json")
  * @param {Function} onProgress – callback(message) for progress updates
  */
 async function scrubFile(repoPath, filePath, onProgress = console.log) {
-  const hasFilterRepo = cmdExists('git-filter-repo');
+  const fullPath = path.join(repoPath, filePath.replace(/\//g, path.sep));
 
-  if (hasFilterRepo) {
-    await rewriteWithFilterRepo(repoPath, filePath, onProgress);
-  } else {
-    await rewriteWithFilterBranch(repoPath, filePath, onProgress);
+  // ── 1. Add to .gitignore first so restoring won't re-track the file ──
+  const added = addToGitignore(repoPath, filePath);
+
+  // ── 2. Backup working tree (rename away so filter-branch doesn't see it) ──
+  const backupPath = backupWorkingTree(fullPath, onProgress);
+
+  // ── 3. Rewrite history ──────────────────────────────────────────────────
+  const hasFilterRepo = cmdExists('git-filter-repo');
+  try {
+    if (hasFilterRepo) {
+      await rewriteWithFilterRepo(repoPath, filePath, onProgress);
+    } else {
+      await rewriteWithFilterBranch(repoPath, filePath, onProgress);
+    }
+  } catch (err) {
+    // Rewrite failed — restore the backup so no data is lost
+    if (backupPath) {
+      onProgress(chalk.yellow('  Rewrite failed — restoring working-tree copy…'));
+      restoreWorkingTree(backupPath, fullPath, onProgress);
+    }
+    throw err;
   }
 
+  // ── 4. Cleanup ─────────────────────────────────────────────────────────
   await cleanup(repoPath, onProgress);
-  const added = addToGitignore(repoPath, filePath);
+
+  // ── 5. Restore working tree — file is now untracked + gitignored ───────
+  if (backupPath) {
+    restoreWorkingTree(backupPath, fullPath, onProgress);
+    onProgress(chalk.green(`  ✔  "${filePath}" is now untracked (data preserved on disk).`));
+  }
 
   return {
     method:         hasFilterRepo ? 'filter-repo' : 'filter-branch',

@@ -225,6 +225,10 @@ async function main() {
     chalk.white(`  File removed  : `) + chalk.bold(selectedFile),
     chalk.white(`  Method used   : `) + chalk.cyan(result.method),
     chalk.white(`  .gitignore    : `) + (result.gitignoreAdded ? chalk.green('entry added') : chalk.gray('already present')),
+    chalk.white(`  Working copy  : `) + chalk.green('preserved on disk (untracked)'),
+    '',
+    chalk.gray(`  Your file/folder is still on disk with its latest content.`),
+    chalk.gray(`  Git no longer knows it exists — it is now untracked.`),
   ]);
 
   printForcePushInstructions(repoPath, remoteUrl);
