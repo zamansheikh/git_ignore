@@ -200,23 +200,10 @@ async function cleanup(repoPath, onProgress) {
  * @param {Function} onProgress – callback(message) for progress updates
  */
 async function scrubFile(repoPath, filePath, onProgress = console.log) {
-  // 1. Add to .gitignore FIRST (so restored copy is immediately untracked)
-  const added = addToGitignore(repoPath, filePath);
-
-  // 1b. Commit .gitignore change so the working tree is clean for filter-branch.
-  //     If .gitignore was modified, we need to stage + commit it, otherwise
-  //     filter-branch refuses to run ("You have unstaged changes").
-  if (added) {
-    onProgress(chalk.gray(`  Committing .gitignore update…`));
-    run('git add .gitignore', repoPath, { silent: true, failOk: true });
-    run('git commit -m "chore: add ' + filePath.replace(/"/g, '\\"') + ' to .gitignore [git-vanish]"', repoPath, { silent: true, failOk: true });
-  }
-
-  // 2. Save working-tree content WITHOUT touching the git index
-  //    (working tree stays perfectly clean for filter-branch)
+  // 1. Save working-tree content WITHOUT touching the git index
   const saved = saveContent(repoPath, filePath, onProgress);
 
-  // 3. Rewrite history
+  // 2. Rewrite history
   const hasFilterRepo = cmdExists('git-filter-repo');
   try {
     if (hasFilterRepo) {
@@ -233,19 +220,18 @@ async function scrubFile(repoPath, filePath, onProgress = console.log) {
     throw err;
   }
 
-  // 4. Cleanup reflogs + gc
+  // 3. Cleanup reflogs + gc
   await cleanup(repoPath, onProgress);
 
-  // 5. Restore working-tree copy (file is now untracked + gitignored)
+  // 4. Restore working-tree copy (file is now untracked)
   if (saved) {
     restoreSaved(saved, onProgress);
   }
 
   return {
-    method:         hasFilterRepo ? 'filter-repo' : 'filter-branch',
-    gitignoreAdded: added,
+    method: hasFilterRepo ? 'filter-repo' : 'filter-branch',
   };
 }
 
-module.exports = { scrubFile };
+module.exports = { scrubFile, addToGitignore };
 

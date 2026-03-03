@@ -15,19 +15,24 @@
 const path     = require('path');
 const fs       = require('fs');
 const chalk    = require('chalk');
+const { spawnSync } = require('child_process');
 const { program } = require('commander');
 const simpleGit   = require('simple-git');
+
+function run(cmd, cwd) {
+  spawnSync(cmd, { cwd, shell: true, stdio: 'pipe' });
+}
 
 const FileBrowser = require('./ui/browser');
 const { confirm, warnBox, successBox } = require('./ui/confirm');
 const { getAllTrackedFiles, findCommitsForFile, getRemoteBranches, getRemoteUrl } = require('./git/history');
-const { scrubFile } = require('./git/rewrite');
+const { scrubFile, addToGitignore } = require('./git/rewrite');
 
 /* ─── CLI setup ──────────────────────────────────────────── */
 
 program
   .name('git-vanish')
-  .version('1.0.0')
+  .version('1.1.0')
   .description(
     'Interactively browse your repo and permanently vanish a sensitive\n' +
     'file from all git commit history — file preserved on disk as untracked.'
@@ -128,20 +133,21 @@ async function main() {
   }
 
   // ── 3. File selection ──────────────────────────────────
-  let selectedFile = opts.file || null;
+  /** @type {string[]} */
+  let selectedFiles = [];
 
-  if (selectedFile) {
-    // normalize slashes
-    selectedFile = selectedFile.replace(/\\/g, '/');
-    console.log(chalk.cyan(` ℹ  Using file from --file flag: ${selectedFile}\n`));
+  if (opts.file) {
+    // normalize slashes, allow comma-separated list
+    selectedFiles = opts.file.split(',').map((f) => f.trim().replace(/\\/g, '/'));
+    console.log(chalk.cyan(` ℹ  File(s) from --file flag: ${selectedFiles.join(', ')}\n`));
   } else {
-    // Open the interactive TUI browser
-    selectedFile = await new Promise((resolve, reject) => {
+    // Open the interactive TUI browser — returns string[]
+    selectedFiles = await new Promise((resolve, reject) => {
       const browser = new FileBrowser({
         root:      repoPath,
         gitFiles:  allTrackedFiles,
-        title:     '  git-vanish — Select file to vanish from history',
-        onSelect:  (rel) => resolve(rel),
+        title:     '  git-vanish — Select file(s) to vanish from history',
+        onSelect:  (files) => resolve(files),
         onCancel:  () => reject(new Error('cancelled')),
       });
       browser.start();
@@ -154,81 +160,121 @@ async function main() {
     });
   }
 
-  // ── 4. Show commits that contain the file ─────────────
-  console.log(chalk.gray('\n ⏳ Searching git history…\n'));
-  const commits = await findCommitsForFile(repoPath, selectedFile);
-
-  if (commits.length === 0) {
-    console.log(chalk.yellow(` ⚠  "${selectedFile}" was not found in any commit.\n`));
-    console.log(chalk.gray('    It may already have been removed, or the path might be wrong.\n'));
+  if (!selectedFiles || selectedFiles.length === 0) {
+    console.log(chalk.yellow('\n  No files selected.\n'));
     process.exit(0);
   }
 
-  printCommitList(commits, selectedFile);
+  // ── 4-7. Per-file: scan → confirm → scrub ─────────────
+  const ora = require('ora');
+  const scrubbedFiles = [];
 
-  // ── 5. Dry-run bail-out ────────────────────────────────
-  if (opts.dryRun) {
-    console.log(chalk.bold.blue(' [DRY RUN] No changes were made.\n'));
-    console.log(chalk.blue(` Would scrub "${selectedFile}" from ${commits.length} commit(s).\n`));
+  for (const selectedFile of selectedFiles) {
+    console.log(chalk.bold.cyan(`\n ── Processing: ${selectedFile} ──`));
+
+    // 4. Show commits that contain the file
+    console.log(chalk.gray('\n ⏳ Searching git history…\n'));
+    const commits = await findCommitsForFile(repoPath, selectedFile);
+
+    if (commits.length === 0) {
+      console.log(chalk.yellow(` ⚠  "${selectedFile}" was not found in any commit — skipping.\n`));
+      continue;
+    }
+
+    printCommitList(commits, selectedFile);
+
+    // 5. Dry-run bail-out
+    if (opts.dryRun) {
+      console.log(chalk.bold.blue(` [DRY RUN] Would scrub "${selectedFile}" from ${commits.length} commit(s).\n`));
+      continue;
+    }
+
+    // 6. Warnings and per-file confirmation
+    const remoteUrl = await getRemoteUrl(repoPath);
+
+    warnBox([
+      chalk.bold.red('  WARNING: This operation rewrites git history.'),
+      '',
+      chalk.white(`  File to remove : `) + chalk.bold.red(selectedFile),
+      chalk.white(`  Affected commits: `) + chalk.bold.yellow(String(commits.length)),
+      chalk.white(`  Repository     : `) + chalk.gray(repoPath),
+      '',
+      chalk.yellow('  • ALL branches and tags that contain this file will be rewritten.'),
+      chalk.yellow('  • You will need to force-push to update any remote (GitHub etc.).'),
+      chalk.yellow('  • All collaborators must re-clone or reset their local copies.'),
+      chalk.yellow('  • Consider rotating any leaked secrets immediately.'),
+      '',
+      chalk.bold('  This CANNOT be undone unless you have a backup.'),
+    ]);
+
+    const ok = await confirm(`Permanently scrub "${selectedFile}" from all ${commits.length} commit(s)?`);
+
+    if (!ok) {
+      console.log(chalk.yellow(`\n  Skipped "${selectedFile}". No changes made for this file.\n`));
+      continue;
+    }
+
+    // 7. Run the scrub
+    const spinner = ora({ text: `Rewriting git history for ${selectedFile}…`, color: 'red' }).start();
+
+    let result;
+    try {
+      result = await scrubFile(repoPath, selectedFile, (msg) => {
+        spinner.text = chalk.gray(msg);
+      });
+      spinner.succeed(chalk.green(`Scrubbed "${selectedFile}" from git history.`));
+      scrubbedFiles.push({ file: selectedFile, method: result.method });
+    } catch (err) {
+      spinner.fail(chalk.red(`Scrub failed for "${selectedFile}".`));
+      console.error('\n' + chalk.red(err.message) + '\n');
+      console.error(chalk.gray(
+        ' Tip: Make sure you have no uncommitted changes before running git-vanish.\n' +
+        ' Run: git stash  then try again.\n'
+      ));
+    }
+  }
+
+  if (scrubbedFiles.length === 0) {
+    if (!opts.dryRun) console.log(chalk.yellow('\n  Nothing was scrubbed.\n'));
     process.exit(0);
   }
 
-  // ── 6. Warnings and confirmation ──────────────────────
+  // ── 8. Opt-in: add scrubbed files to .gitignore ───────
   const remoteUrl = await getRemoteUrl(repoPath);
 
-  warnBox([
-    chalk.bold.red('  WARNING: This operation rewrites git history.'),
-    '',
-    chalk.white(`  File to remove : `) + chalk.bold.red(selectedFile),
-    chalk.white(`  Affected commits: `) + chalk.bold.yellow(String(commits.length)),
-    chalk.white(`  Repository     : `) + chalk.gray(repoPath),
-    '',
-    chalk.yellow('  • ALL branches and tags that contain this file will be rewritten.'),
-    chalk.yellow('  • You will need to force-push to update any remote (GitHub etc.).'),
-    chalk.yellow('  • All collaborators must re-clone or reset their local copies.'),
-    chalk.yellow('  • Consider rotating any leaked secrets immediately.'),
-    '',
-    chalk.bold('  This CANNOT be undone unless you have a backup.'),
-  ]);
+  const addToIgnore = await confirm(
+    `Add ${scrubbedFiles.length} scrubbed file(s) to .gitignore to prevent future accidents?`
+  );
 
-  const ok = await confirm(`Permanently scrub "${selectedFile}" from all ${commits.length} commit(s)?`);
-
-  if (!ok) {
-    console.log(chalk.yellow('\n  Aborted. No changes were made.\n'));
-    process.exit(0);
+  const gitignoreResults = [];
+  if (addToIgnore) {
+    for (const { file } of scrubbedFiles) {
+      const added = addToGitignore(repoPath, file);
+      gitignoreResults.push({ file, added });
+    }
+    // Commit the .gitignore update so the working tree stays clean
+    try {
+      run('git add .gitignore', repoPath, { silent: true, failOk: true });
+      run('git commit -m "chore: add scrubbed files to .gitignore [git-vanish]"', repoPath, { silent: true, failOk: true });
+      console.log(chalk.green('\n  ✔  .gitignore updated and committed.\n'));
+    } catch {}
   }
 
-  // ── 7. Run the scrub ───────────────────────────────────
-  const ora = require('ora');
-  const spinner = ora({ text: 'Rewriting git history…', color: 'red' }).start();
-
-  let result;
-  try {
-    result = await scrubFile(repoPath, selectedFile, (msg) => {
-      spinner.text = chalk.gray(msg);
-    });
-    spinner.succeed(chalk.green('Git history rewritten successfully.'));
-  } catch (err) {
-    spinner.fail(chalk.red('Scrub failed.'));
-    console.error('\n' + chalk.red(err.message) + '\n');
-    console.error(chalk.gray(
-      ' Tip: Make sure you have no uncommitted changes before running git-vanish.\n' +
-      ' Run: git stash  then try again.\n'
-    ));
-    process.exit(1);
-  }
-
-  // ── 8. Success summary ─────────────────────────────────
+  // ── 9. Success summary ─────────────────────────────────
   successBox([
-    chalk.bold.green('  ✔  File successfully scrubbed from all git history!'),
+    chalk.bold.green(`  ✔  ${scrubbedFiles.length} file(s) successfully scrubbed from all git history!`),
     '',
-    chalk.white(`  File removed  : `) + chalk.bold(selectedFile),
-    chalk.white(`  Method used   : `) + chalk.cyan(result.method),
-    chalk.white(`  .gitignore    : `) + (result.gitignoreAdded ? chalk.green('entry added') : chalk.gray('already present')),
-    chalk.white(`  Working copy  : `) + chalk.green('preserved on disk (untracked)'),
+    ...scrubbedFiles.map(({ file, method }) =>
+      chalk.white(`  ${file}`) + chalk.cyan(`  [${method}]`)
+    ),
     '',
-    chalk.gray(`  Your file/folder is still on disk with its latest content.`),
-    chalk.gray(`  Git no longer knows it exists — it is now untracked.`),
+    chalk.white(`  .gitignore : `) + (addToIgnore
+      ? chalk.green(`${gitignoreResults.filter((r) => r.added).length} entry/entries added`)
+      : chalk.gray('skipped (you chose not to add)')),
+    chalk.white(`  Working copy: `) + chalk.green('preserved on disk (untracked)'),
+    '',
+    chalk.gray(`  Your file(s) are still on disk with their latest content.`),
+    chalk.gray(`  Git no longer knows they exist — they are now untracked.`),
   ]);
 
   printForcePushInstructions(repoPath, remoteUrl);

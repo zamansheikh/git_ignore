@@ -1,6 +1,6 @@
 {
   "name": "git-vanish",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "description": "Interactively browse your repo and permanently vanish sensitive files from all git commit history — secrets gone from every commit, file preserved on disk as untracked.",
   "bin": {
     "git-vanish": "./bin/git-vanish.js"
