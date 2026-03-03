@@ -5,21 +5,25 @@
  *
  * Strategy
  * ────────
- * 1. Run  git filter-branch --force --index-filter "git rm --cached --ignore-unmatch <file>"
- *         --prune-empty --tag-name-filter cat -- --all
- *    This is universally available (built into git). It rewrites every branch/tag.
+ * 1. Save the current working-tree copy of the target BEFORE rewriting:
+ *      • File      → read content into a Buffer (no filesystem change)
+ *      • Directory → copy to os.tmpdir() (outside the repo, git doesn't see it)
  *
- * 2. Expire reflogs and GC aggressively so the file is truly gone locally.
+ * 2. Run `git rm -rf <path>` so the working tree is clean before filter-branch.
  *
- * 3. Print the correct force-push commands so users can clean the remote too.
+ * 3. Run git filter-repo (preferred) or git filter-branch to rewrite every
+ *    branch/tag and remove the file from all commits.
  *
- * Note: git-filter-repo (Python) is faster but not bundled with git. We fall
- *       back to it if present because it also automatically handles the gc/reflog
- *       steps. We try filter-repo first, then filter-branch.
+ * 4. Expire reflogs + gc so the file is truly gone from the object store.
+ *
+ * 5. Restore the saved content back to its original path on disk.
+ *    The file is now UNTRACKED (listed in .gitignore) — data fully preserved.
  */
 
-const { execSync, spawnSync } = require('child_process');
-const path  = require('path');
+const { spawnSync } = require('child_process');
+const os   = require('os');
+const path = require('path');
+const fs   = require('fs');
 const chalk = require('chalk');
 
 /* ─── helpers ──────────────────────────────────────────────── */
@@ -31,7 +35,6 @@ function run(cmd, cwd, { silent = false, failOk = false } = {}) {
     stdio: silent ? 'pipe' : 'inherit',
     env: {
       ...process.env,
-      // Silence git filter-branch warnings about being slow
       FILTER_BRANCH_SQUELCH_WARNING: '1',
     },
   });
@@ -43,24 +46,134 @@ function run(cmd, cwd, { silent = false, failOk = false } = {}) {
   return res.stdout ? res.stdout.toString().trim() : '';
 }
 
-/** Check if a command exists in PATH */
 function cmdExists(name) {
   try {
-    const r = spawnSync(name, ['--version'], { shell: true, stdio: 'pipe' });
-    return r.status === 0;
-  } catch {
-    return false;
+    return spawnSync(name, ['--version'], { shell: true, stdio: 'pipe' }).status === 0;
+  } catch { return false; }
+}
+
+/* ─── working tree backup / restore ───────────────────────── */
+
+/**
+ * Save the current on-disk copy of `fullPath` without touching the git index.
+ *
+ * File      → Content is read into memory (a Buffer). Zero filesystem change,
+ *             so the working tree stays clean for filter-branch.
+ * Directory → Recursively copied to a temp directory OUTSIDE the repo
+ *             so git is unaware of the copy.
+ *
+ * After saving we call `git rm -rf <path>` to stage the deletion and remove
+ * the file from disk, giving filter-branch a clean working tree.
+ *
+ * Returns a descriptor: { type, data } or null if path doesn't exist.
+ */
+function saveAndStageRemoval(repoPath, filePath, onProgress) {
+  const fullPath = path.join(repoPath, filePath.replace(/\//g, path.sep).replace(/\/$/, ''));
+
+  if (!fs.existsSync(fullPath)) return null;
+
+  const stat = fs.statSync(fullPath);
+
+  let saved;
+
+  if (stat.isDirectory()) {
+    // Copy directory to a temp location outside the repo
+    const tmpDest = path.join(os.tmpdir(), `git-scrub-${Date.now()}-${path.basename(fullPath)}`);
+    onProgress(chalk.gray(`  Saving directory copy → ${tmpDest}`));
+    copyDirSync(fullPath, tmpDest);
+    saved = { type: 'dir', tmp: tmpDest, dest: fullPath };
+
+  } else {
+    // Read file content into memory — no filesystem change
+    onProgress(chalk.gray(`  Saving file content in memory…`));
+    const content  = fs.readFileSync(fullPath);
+    const encoding = detectEncoding(fullPath);
+    saved = { type: 'file', content, encoding, dest: fullPath };
   }
+
+  // Stage the deletion so filter-branch finds a clean working tree
+  onProgress(chalk.gray(`  Staging removal of "${filePath}" from working tree…`));
+  run(`git rm -rf "${filePath.replace(/\\/g, '/')}"`, repoPath, { failOk: true, silent: true });
+
+  return saved;
+}
+
+/**
+ * After history rewrite, put the saved content back on disk.
+ * The file lands as UNTRACKED (it's in .gitignore).
+ */
+function restoreSaved(saved, onProgress) {
+  if (!saved) return;
+
+  // Ensure parent exists
+  const parent = path.dirname(saved.dest);
+  if (!fs.existsSync(parent)) fs.mkdirSync(parent, { recursive: true });
+
+  if (saved.type === 'dir') {
+    if (fs.existsSync(saved.dest)) {
+      fs.rmSync(saved.dest, { recursive: true, force: true });
+    }
+    onProgress(chalk.gray(`  Restoring directory from temp…`));
+    copyDirSync(saved.tmp, saved.dest);
+    // Clean up temp copy
+    try { fs.rmSync(saved.tmp, { recursive: true, force: true }); } catch {}
+
+  } else {
+    onProgress(chalk.gray(`  Writing file content back to disk…`));
+    fs.writeFileSync(saved.dest, saved.content);
+  }
+
+  onProgress(chalk.green(`  ✔  "${path.basename(saved.dest)}" restored as untracked — data preserved.`));
+}
+
+/** Recursive directory copy (pure Node, no deps) */
+function copyDirSync(src, dest) {
+  fs.mkdirSync(dest, { recursive: true });
+  for (const entry of fs.readdirSync(src, { withFileTypes: true })) {
+    const s = path.join(src, entry.name);
+    const d = path.join(dest, entry.name);
+    if (entry.isDirectory()) {
+      copyDirSync(s, d);
+    } else {
+      fs.copyFileSync(s, d);
+    }
+  }
+}
+
+/** Decide whether to write back as utf8 string or raw Buffer */
+function detectEncoding(filePath) {
+  const textExts = new Set([
+    '.txt','.html','.htm','.css','.js','.ts','.jsx','.tsx','.json',
+    '.xml','.yaml','.yml','.md','.env','.sh','.bat','.ps1','.py',
+    '.rb','.go','.rs','.java','.c','.cpp','.h','.cs','.php','.sql',
+  ]);
+  return textExts.has(path.extname(filePath).toLowerCase()) ? 'utf8' : null;
+}
+
+/* ─── add to .gitignore ────────────────────────────────────── */
+
+function addToGitignore(repoPath, filePath) {
+  const ignorePath = path.join(repoPath, '.gitignore');
+  const gitPath    = filePath.replace(/\\/g, '/').replace(/\/$/, '');
+
+  let existing = '';
+  if (fs.existsSync(ignorePath)) {
+    existing = fs.readFileSync(ignorePath, 'utf8');
+    const lines   = existing.split('\n').map((l) => l.trim());
+    const checked = [gitPath, gitPath + '/', '/' + gitPath, '/' + gitPath + '/'];
+    if (checked.some((v) => lines.includes(v))) return false;
+  }
+
+  const newEntry = `\n# Added by git-scrub — removed from history\n${gitPath}\n`;
+  fs.writeFileSync(ignorePath, existing + newEntry, 'utf8');
+  return true;
 }
 
 /* ─── approach 1 – git filter-repo (preferred) ────────────── */
 
 async function rewriteWithFilterRepo(repoPath, filePath, onProgress) {
   onProgress('Using git filter-repo (fast path)…');
-
-  // Normalize path separators for git
-  const gitPath = filePath.replace(/\\/g, '/');
-
+  const gitPath = filePath.replace(/\\/g, '/').replace(/\/$/, '');
   run(`git filter-repo --force --path "${gitPath}" --invert-paths`, repoPath);
   onProgress('git filter-repo complete.');
 }
@@ -71,136 +184,51 @@ async function rewriteWithFilterBranch(repoPath, filePath, onProgress) {
   onProgress('Using git filter-branch (universal path)…');
   onProgress(chalk.gray('  This may take a while on repos with many commits.\n'));
 
-  const gitPath = filePath.replace(/\\/g, '/');
-
-  // On Windows the index-filter command runs inside Git's sh.exe, so use
-  // the POSIX command with forward slashes.
-  // Use -r so that directories (e.g. node_modules/) are removed recursively.
+  const gitPath     = filePath.replace(/\\/g, '/').replace(/\/$/, '');
   const indexFilter = `git rm -r --cached --ignore-unmatch "${gitPath}"`;
 
   run(
     `git filter-branch --force --index-filter "${indexFilter}" --prune-empty --tag-name-filter cat -- --all`,
     repoPath
   );
-
-  onProgress('filter-branch complete. Cleaning up backups and reflogs…');
+  onProgress('filter-branch complete.');
 }
 
-/* ─── cleanup (remove local traces) ───────────────────────── */
+/* ─── cleanup ──────────────────────────────────────────────── */
 
 async function cleanup(repoPath, onProgress) {
   onProgress('Removing filter-branch backup refs…');
-  run('git for-each-ref --format="%(refname)" refs/original/ | xargs -r git update-ref -d', repoPath, { failOk: true, silent: true });
-  // Windows-compatible alternative
-  run('git update-ref -d refs/original/refs/heads/main 2>NUL || exit 0', repoPath, { failOk: true, silent: true });
+  // Remove all original/* refs
+  const refs = run('git for-each-ref --format="%(refname)" refs/original/', repoPath, { silent: true, failOk: true });
+  for (const ref of refs.split('\n').filter(Boolean)) {
+    run(`git update-ref -d "${ref}"`, repoPath, { failOk: true, silent: true });
+  }
 
   onProgress('Expiring reflogs…');
   run('git reflog expire --expire=now --all', repoPath, { failOk: true });
 
-  onProgress('Running aggressive garbage collection (this may take a minute)…');
+  onProgress('Running garbage collection…');
   run('git gc --prune=now --aggressive', repoPath, { failOk: true });
-}
-
-/* ─── add to .gitignore ────────────────────────────────────── */
-
-const fs = require('fs');
-
-function addToGitignore(repoPath, filePath) {
-  const ignorePath = path.join(repoPath, '.gitignore');
-  const gitPath    = filePath.replace(/\\/g, '/');
-
-  let existing = '';
-  if (fs.existsSync(ignorePath)) {
-    existing = fs.readFileSync(ignorePath, 'utf8');
-    // Check if already present (with or without leading slash, with or without trailing slash)
-    const lines   = existing.split('\n').map((l) => l.trim());
-    const base    = gitPath.replace(/\/$/, '');        // strip trailing slash
-    const checked = [base, base + '/', '/' + base, '/' + base + '/'];
-    if (checked.some((v) => lines.includes(v))) {
-      return false; // already ignored
-    }
-  }
-
-  const newEntry = `\n# Added by git-scrub — sensitive file removed from history\n${gitPath}\n`;
-  fs.writeFileSync(ignorePath, existing + newEntry, 'utf8');
-  return true;
-}
-
-/* ─── working tree backup / restore ───────────────────────── */
-
-/**
- * Preserve the current working-tree copy of the target BEFORE git rewrites
- * history (which will delete the file/directory from the working tree as it
- * checks out the new HEAD that no longer contains the path).
- *
- * Strategy:
- *  • Directory → rename to <path>.git-scrub-bak  (instant, zero extra disk)
- *  • File      → rename to <path>.git-scrub-bak
- *
- * Returns the backup path, or null if nothing existed on disk.
- */
-function backupWorkingTree(fullPath, onProgress) {
-  if (!fs.existsSync(fullPath)) return null;
-
-  const backupPath = fullPath.replace(/\\/g, '/').replace(/\/$/, '') + '.git-scrub-bak';
-
-  // Remove stale backup if one exists from a previous failed run
-  if (fs.existsSync(backupPath)) {
-    try { fs.rmSync(backupPath, { recursive: true, force: true }); } catch {}
-  }
-
-  fs.renameSync(fullPath, backupPath);
-  onProgress(chalk.gray(`  Working-tree copy saved → ${path.basename(backupPath)}`));
-  return backupPath;
-}
-
-/**
- * After history rewrite, move the backup back to the original path.
- * The file becomes untracked (because .gitignore now lists it).
- */
-function restoreWorkingTree(backupPath, fullPath, onProgress) {
-  if (!fs.existsSync(backupPath)) return;
-
-  // If git somehow put an empty placeholder there, remove it first
-  if (fs.existsSync(fullPath)) {
-    try { fs.rmSync(fullPath, { recursive: true, force: true }); } catch {}
-  }
-
-  // Ensure parent directory exists
-  const parent = path.dirname(fullPath);
-  if (!fs.existsSync(parent)) fs.mkdirSync(parent, { recursive: true });
-
-  fs.renameSync(backupPath, fullPath);
-  onProgress(chalk.gray(`  Working-tree copy restored → ${path.basename(fullPath)}`));
 }
 
 /* ─── main export ──────────────────────────────────────────── */
 
 /**
- * Remove a file/directory from ALL git history while preserving the current
- * working-tree copy as an untracked file.
- *
- * Flow:
- *  1. Add path to .gitignore (so after restore git won't re-track it)
- *  2. Rename file/dir to a temp backup name (instant — no copying)
- *  3. Rewrite history (filter-repo or filter-branch)
- *  4. Clean up reflogs + run gc
- *  5. Rename backup back to original — file is now untracked, data preserved
+ * Remove a file/directory from ALL git history while preserving the
+ * current working-tree copy as an untracked file.
  *
  * @param {string}   repoPath   – absolute path to git repo root
  * @param {string}   filePath   – repo-relative path (e.g. "config/secrets.json")
  * @param {Function} onProgress – callback(message) for progress updates
  */
 async function scrubFile(repoPath, filePath, onProgress = console.log) {
-  const fullPath = path.join(repoPath, filePath.replace(/\//g, path.sep));
-
-  // ── 1. Add to .gitignore first so restoring won't re-track the file ──
+  // 1. Add to .gitignore FIRST (so restored copy is immediately untracked)
   const added = addToGitignore(repoPath, filePath);
 
-  // ── 2. Backup working tree (rename away so filter-branch doesn't see it) ──
-  const backupPath = backupWorkingTree(fullPath, onProgress);
+  // 2. Save working-tree content + stage removal (cleans working tree for filter-branch)
+  const saved = saveAndStageRemoval(repoPath, filePath, onProgress);
 
-  // ── 3. Rewrite history ──────────────────────────────────────────────────
+  // 3. Rewrite history
   const hasFilterRepo = cmdExists('git-filter-repo');
   try {
     if (hasFilterRepo) {
@@ -209,21 +237,20 @@ async function scrubFile(repoPath, filePath, onProgress = console.log) {
       await rewriteWithFilterBranch(repoPath, filePath, onProgress);
     }
   } catch (err) {
-    // Rewrite failed — restore the backup so no data is lost
-    if (backupPath) {
-      onProgress(chalk.yellow('  Rewrite failed — restoring working-tree copy…'));
-      restoreWorkingTree(backupPath, fullPath, onProgress);
+    // Rewrite failed — restore so no data is lost
+    if (saved) {
+      onProgress(chalk.yellow('  Rewrite failed — restoring your file/directory…'));
+      restoreSaved(saved, onProgress);
     }
     throw err;
   }
 
-  // ── 4. Cleanup ─────────────────────────────────────────────────────────
+  // 4. Cleanup reflogs + gc
   await cleanup(repoPath, onProgress);
 
-  // ── 5. Restore working tree — file is now untracked + gitignored ───────
-  if (backupPath) {
-    restoreWorkingTree(backupPath, fullPath, onProgress);
-    onProgress(chalk.green(`  ✔  "${filePath}" is now untracked (data preserved on disk).`));
+  // 5. Restore working-tree copy (file is now untracked + gitignored)
+  if (saved) {
+    restoreSaved(saved, onProgress);
   }
 
   return {
@@ -233,3 +260,4 @@ async function scrubFile(repoPath, filePath, onProgress = console.log) {
 }
 
 module.exports = { scrubFile };
+
