@@ -203,6 +203,15 @@ async function scrubFile(repoPath, filePath, onProgress = console.log) {
   // 1. Add to .gitignore FIRST (so restored copy is immediately untracked)
   const added = addToGitignore(repoPath, filePath);
 
+  // 1b. Commit .gitignore change so the working tree is clean for filter-branch.
+  //     If .gitignore was modified, we need to stage + commit it, otherwise
+  //     filter-branch refuses to run ("You have unstaged changes").
+  if (added) {
+    onProgress(chalk.gray(`  Committing .gitignore update…`));
+    run('git add .gitignore', repoPath, { silent: true, failOk: true });
+    run('git commit -m "chore: add ' + filePath.replace(/"/g, '\\"') + ' to .gitignore [git-scrub]"', repoPath, { silent: true, failOk: true });
+  }
+
   // 2. Save working-tree content WITHOUT touching the git index
   //    (working tree stays perfectly clean for filter-branch)
   const saved = saveContent(repoPath, filePath, onProgress);
