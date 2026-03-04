@@ -1,5 +1,7 @@
 # git-vanish 🔥
 
+![git-vanish](./git-vanish.png)
+
 > Interactively browse your repo and **permanently vanish a sensitive file from all git commit history** — without deleting your other commits.
 
 ## The problem
@@ -59,17 +61,20 @@ git-vanish --repo /path/to/my-project
 
 ## Keyboard Controls (file browser)
 
-| Key               | Action                        |
-| ----------------- | ----------------------------- |
-| `↑` / `↓`         | Navigate up/down              |
-| `→` / `Enter`     | Open directory or select file |
-| `←` / `Backspace` | Go up one directory           |
-| `j` / `k`         | Vim-style up/down             |
-| `/`               | Search/filter entries         |
-| `Escape`          | Clear search                  |
-| `Page Up/Down`    | Jump one page                 |
-| `Home` / `End`    | Jump to first/last            |
-| `q`               | Quit without selecting        |
+| Key               | Action                                   |
+| ----------------- | ---------------------------------------- |
+| `↑` / `↓`         | Navigate up/down                         |
+| `→` / `Enter`     | Open directory or quick-select file      |
+| `←` / `Backspace` | Go up one directory                      |
+| `j` / `k`         | Vim-style up/down                        |
+| `Space`           | Toggle file selection (multi-select)     |
+| `a`               | Select all tracked files in current view |
+| `u`               | Deselect all                             |
+| `/`               | Search/filter entries                    |
+| `Escape`          | Clear search                             |
+| `Page Up/Down`    | Jump one page                            |
+| `Home` / `End`    | Jump to first/last                       |
+| `q`               | Quit without selecting                   |
 
 ---
 

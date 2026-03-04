@@ -19,7 +19,7 @@ const path = require('path');
 const readline = require('readline');
 const chalk = require('chalk');
 
-const PAGE_SIZE = process.stdout.rows ? process.stdout.rows - 12 : 13;
+const PAGE_SIZE = Math.max(3, (process.stdout.rows || 25) - 12);
 
 class FileBrowser {
   constructor(options = {}) {
