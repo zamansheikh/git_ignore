@@ -28,6 +28,7 @@ const { confirm, warnBox, successBox } = require('./ui/confirm');
 const { getAllTrackedFiles, findCommitsForFile, getRemoteBranches, getRemoteUrl } = require('./git/history');
 const { scrubFile, addToGitignore } = require('./git/rewrite');
 const { redactSecrets, maskSecret } = require('./git/redact');
+const { reassignAuthors, listAuthors } = require('./git/reassign');
 
 /* ─── CLI setup ──────────────────────────────────────────── */
 
@@ -57,6 +58,17 @@ program
     'File with one secret per line to redact (safer than --secret: keeps them out of shell history)'
   )
   .option('--replacement <text>', 'Text to substitute for redacted secrets', '***REMOVED***')
+  // Author reassignment — for when a person, not a file or a string, has to
+  // come out of the history.
+  .option(
+    '--list-authors',
+    'List everyone who appears in history, with commit counts, then exit'
+  )
+  .option(
+    '--reassign <mapping>',
+    'Reassign commits: "Old Name <old@mail>=New Name <new@mail>" (repeatable)',
+    (val, prev) => (prev || []).concat([val])
+  )
   .parse(process.argv);
 
 const opts = program.opts();
@@ -139,7 +151,58 @@ async function main() {
 
   console.log(chalk.gray(` ✔  Repo root: ${repoPath}\n`));
 
-  // ── 1b. Redaction mode ─────────────────────────────────
+  // ── 1a. List authors ───────────────────────────────────
+  // Read-only, so it runs before every other mode and exits.
+  if (opts.listAuthors) {
+    const authors = listAuthors(repoPath);
+    console.log(chalk.bold(` ${authors.length} identit${authors.length === 1 ? 'y' : 'ies'} in history:\n`));
+    const width = Math.max(...authors.map((a) => `${a.name} <${a.email}>`.length));
+    for (const a of authors) {
+      const who = `${a.name} <${a.email}>`;
+      console.log(`   ${who.padEnd(width)}  ${String(a.count).padStart(6)} refs`);
+    }
+    console.log(chalk.gray('\n  "refs" counts author + committer entries, so a commit can count twice.'));
+    console.log(chalk.gray('  Reassign with:  git-vanish --reassign "Old <old@mail>=New <new@mail>"\n'));
+    return;
+  }
+
+  // ── 1b. Author reassignment ────────────────────────────
+  if (opts.reassign && opts.reassign.length > 0) {
+    const pairs = opts.reassign.map((raw) => {
+      const at = raw.indexOf('=');
+      if (at < 0) {
+        console.error(chalk.red(`\n ✘  Bad mapping: ${raw}`));
+        console.error(chalk.gray('    Expected:  "Old Name <old@mail>=New Name <new@mail>"\n'));
+        process.exit(1);
+      }
+      return { from: raw.slice(0, at), to: raw.slice(at + 1) };
+    });
+
+    const dirty = spawnSync('git', ['status', '--porcelain', '--untracked-files=no'], {
+      cwd: repoPath, stdio: 'pipe',
+    }).stdout.toString().trim();
+    if (dirty && !opts.dryRun) {
+      console.error(chalk.red('\n ✘  Tracked files are modified.\n'));
+      console.error(chalk.gray('    History rewriting rewrites every commit — commit or stash first.\n'));
+      process.exit(1);
+    }
+
+    console.log(chalk.bold(` Reassigning authorship on ${pairs.length} identit${pairs.length === 1 ? 'y' : 'ies'}:\n`));
+    const result = await reassignAuthors(repoPath, pairs, { dryRun: opts.dryRun },
+      (msg) => console.log('   ' + msg));
+
+    if (result.changed) {
+      console.log(chalk.yellow(`\n  History rewritten. Every commit hash has changed.\n`));
+      console.log(chalk.gray('  Files, messages and dates are untouched — only the identity moved.\n'));
+      console.log(chalk.cyan('    git remote add origin <your-remote-url>'));
+      console.log(chalk.cyan('    git push --force --all'));
+      console.log(chalk.cyan('    git push --force --tags\n'));
+      console.log(chalk.gray('  Existing clones and forks keep the old identity until they re-clone.\n'));
+    }
+    return;
+  }
+
+  // ── 1c. Redaction mode ─────────────────────────────────
   // Runs instead of the file browser: the file stays tracked, only the
   // secret's bytes are rewritten across every commit.
   const inlineSecrets = opts.secret || [];

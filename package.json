@@ -1,7 +1,7 @@
 {
   "name": "git-vanish",
-  "version": "1.3.0",
-  "description": "Vanish sensitive files from all git commit history, or redact a leaked secret from every commit while keeping the file tracked.",
+  "version": "1.4.0",
+  "description": "Vanish sensitive files from all git commit history, redact a leaked secret from every commit, or reassign a contributor's commits to someone else.",
   "bin": {
     "git-vanish": "bin/git-vanish.js"
   },
@@ -35,7 +35,11 @@
     "password",
     "vanish",
     "redact",
-    "filter-repo"
+    "filter-repo",
+    "author",
+    "mailmap",
+    "attribution",
+    "contributor"
   ],
   "author": "zamansheikh",
   "license": "MIT",

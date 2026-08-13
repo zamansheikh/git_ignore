@@ -41,6 +41,23 @@ This opens an **interactive terminal file browser** where you can navigate your 
 | `-V, --version`     | Show version                                  |
 | `-h, --help`        | Show help                                     |
 
+
+### Examples
+
+```bash
+# Interactive file browser
+git-vanish
+
+# Vanish a specific file directly
+git-vanish --file config/secrets.json
+
+# Preview only (no changes)
+git-vanish --dry-run
+
+# Different repo
+git-vanish --repo /path/to/my-project
+```
+
 ---
 
 ## Redaction mode — when the secret is *inside* a file you need to keep
@@ -92,21 +109,53 @@ Notes:
 before the rewrite still has it, and hosts like GitHub can keep old commits
 reachable by SHA until they garbage-collect. Rotate first, redact second.
 
-### Examples
+---
+
+## Reassign authorship — when a *person* has to come out of the history
+
+A contributor leaves and their identity should not stay on every commit: a
+personal email that was never meant to be public, a closed account, or several
+identities that should be one.
+
+Every commit, file, message and date is preserved. Only the author and
+committer change, so `git log --stat` reads exactly the same afterwards.
 
 ```bash
-# Interactive file browser
-git-vanish
+# See who is actually in there first
+git-vanish --list-authors
 
-# Vanish a specific file directly
-git-vanish --file config/secrets.json
+# Move everything from one identity to another
+git-vanish --reassign "Old Name <old@mail.com>=New Name <new@mail.com>"
 
-# Preview only (no changes)
-git-vanish --dry-run
+# Preview it
+git-vanish --reassign "Old Name <old@mail.com>=New Name <new@mail.com>" --dry-run
 
-# Different repo
-git-vanish --repo /path/to/my-project
+# Several at once
+git-vanish \
+  --reassign "Alice <alice@old.com>=Alice <alice@new.com>" \
+  --reassign "bob <bob@laptop.local>=Bob <bob@new.com>"
 ```
+
+| Flag | Description |
+| --- | --- |
+| `--list-authors` | Everyone in history with commit counts, then exit |
+| `--reassign <mapping>` | `"Old <old@mail>=New <new@mail>"` (repeatable) |
+
+Notes:
+
+- Matching is by **email**, so someone who committed under several display
+  names is caught by one rule.
+- Both the **author** and the **committer** are rewritten. Missing the committer
+  is the usual mistake: a rebase or squashed merge leaves a person as committer
+  on work they did not author, and half the history keeps their name.
+- The commit count is checked before and after. If it changes, the run fails
+  rather than leaving you with something to force-push.
+- Requires **git-filter-repo**, and a clean working tree.
+
+⚠️ This removes *attribution*, not copyright. If the person holds copyright in
+the code, their licence terms still apply whatever the metadata says. And it
+only rewrites this copy — existing clones and forks keep the original identity
+until they re-clone.
 
 ---
 
