@@ -27,20 +27,36 @@ const FileBrowser = require('./ui/browser');
 const { confirm, warnBox, successBox } = require('./ui/confirm');
 const { getAllTrackedFiles, findCommitsForFile, getRemoteBranches, getRemoteUrl } = require('./git/history');
 const { scrubFile, addToGitignore } = require('./git/rewrite');
+const { redactSecrets, maskSecret } = require('./git/redact');
 
 /* ─── CLI setup ──────────────────────────────────────────── */
 
 program
   .name('git-vanish')
-  .version('1.1.0')
+  // Read from package.json so --version can never drift from the published release.
+  .version(require('../package.json').version)
   .description(
     'Interactively browse your repo and permanently vanish a sensitive\n' +
-    'file from all git commit history — file preserved on disk as untracked.'
+    'file from all git commit history — file preserved on disk as untracked.\n' +
+    'Or use --secret to redact a leaked string from every commit while\n' +
+    'keeping the file that contained it tracked.'
   )
   .option('-r, --repo <path>',  'Path to the git repository (default: cwd)')
   .option('-f, --file <path>',  'Repo-relative file path to scrub (skip the browser)')
   .option('--no-gc',             'Skip the garbage collection step (faster, less thorough)')
   .option('--dry-run',           'Show what would happen without changing anything')
+  // Redaction mode — for a secret embedded in a file you need to KEEP.
+  // Removing the whole file would delete real source from every commit.
+  .option(
+    '-s, --secret <text>',
+    'Redact this literal string from all history, keeping files tracked (repeatable)',
+    (val, prev) => (prev || []).concat([val])
+  )
+  .option(
+    '--secrets-file <path>',
+    'File with one secret per line to redact (safer than --secret: keeps them out of shell history)'
+  )
+  .option('--replacement <text>', 'Text to substitute for redacted secrets', '***REMOVED***')
   .parse(process.argv);
 
 const opts = program.opts();
@@ -122,6 +138,44 @@ async function main() {
   }
 
   console.log(chalk.gray(` ✔  Repo root: ${repoPath}\n`));
+
+  // ── 1b. Redaction mode ─────────────────────────────────
+  // Runs instead of the file browser: the file stays tracked, only the
+  // secret's bytes are rewritten across every commit.
+  const inlineSecrets = opts.secret || [];
+  const fileSecrets = opts.secretsFile
+    ? fs.readFileSync(path.resolve(opts.secretsFile), 'utf8')
+        .split('\n').map((l) => l.trim()).filter((l) => l && !l.startsWith('#'))
+    : [];
+  const secrets = [...inlineSecrets, ...fileSecrets];
+
+  if (secrets.length > 0) {
+    const dirty = spawnSync('git', ['status', '--porcelain'], {
+      cwd: repoPath, stdio: 'pipe',
+    }).stdout.toString().trim();
+    if (dirty && !opts.dryRun) {
+      console.error(chalk.red('\n ✘  Working tree is not clean.\n'));
+      console.error(chalk.gray('    History rewriting rewrites every commit — commit or stash first.\n'));
+      process.exit(1);
+    }
+
+    console.log(chalk.bold(` Redacting ${secrets.length} secret(s) from all history:\n`));
+    const result = await redactSecrets(
+      repoPath, secrets,
+      { replacement: opts.replacement, dryRun: opts.dryRun },
+      (msg) => console.log('   ' + msg)
+    );
+
+    if (result.changed) {
+      console.log(chalk.yellow(`\n  History rewritten. Every commit hash has changed.\n`));
+      console.log(chalk.gray('  filter-repo removes the remote as a safety measure. To publish:\n'));
+      console.log(chalk.cyan('    git remote add origin <your-remote-url>'));
+      console.log(chalk.cyan('    git push --force --all'));
+      console.log(chalk.cyan('    git push --force --tags\n'));
+      console.log(chalk.gray('  Everyone else must re-clone — their old clones still contain the secret.\n'));
+    }
+    return;
+  }
 
   // ── 2. Load all git-tracked files (for the TUI) ────────
   console.log(chalk.gray(' ⏳ Loading file list from git history…'));

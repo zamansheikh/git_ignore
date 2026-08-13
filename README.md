@@ -41,6 +41,57 @@ This opens an **interactive terminal file browser** where you can navigate your 
 | `-V, --version`     | Show version                                  |
 | `-h, --help`        | Show help                                     |
 
+---
+
+## Redaction mode — when the secret is *inside* a file you need to keep
+
+Vanishing a whole file is right for something that should never have been tracked
+(`.env`, `credentials.json`). It's the wrong move when the leak is a hardcoded
+password or token inside a real source file: removing the file would delete that
+source from every historical commit.
+
+Redaction mode rewrites the **content** instead. Every occurrence of the secret
+across all commits, branches and tags becomes a placeholder, and the files stay
+exactly where they are, still tracked.
+
+```bash
+# one or more secrets, repeatable
+git-vanish --secret "hunter2" --secret "my-db-password"
+
+# preview first — always do this
+git-vanish --secret "hunter2" --dry-run
+
+# read them from a file instead, so they never touch your shell history
+git-vanish --secrets-file ./leaked-secrets.txt
+```
+
+| Flag                    | Description                                                |
+| ----------------------- | ---------------------------------------------------------- |
+| `-s, --secret <text>`   | Literal string to redact from all history (repeatable)     |
+| `--secrets-file <path>` | One secret per line; `#` comments and blank lines ignored  |
+| `--replacement <text>`  | Substituted text (default `***REMOVED***`)                 |
+
+Notes:
+
+- Requires **git-filter-repo** (`brew install git-filter-repo` / `pip install git-filter-repo`).
+  `filter-branch` can't do this safely — it would need a tree-filter rewriting
+  every blob on every commit.
+- The working tree must be clean; history rewriting touches every commit.
+- Secrets are **masked** in all terminal output, and the temp replacement list is
+  deleted afterwards.
+- After the rewrite, git-vanish re-checks every secret and **fails loudly** if any
+  occurrence survived.
+- `git-filter-repo` removes your `origin` remote on purpose. Re-add it and force-push:
+
+  ```bash
+  git remote add origin <url>
+  git push --force --all && git push --force --tags
+  ```
+
+⚠️ **Redaction is not a substitute for rotating the secret.** Anyone who cloned
+before the rewrite still has it, and hosts like GitHub can keep old commits
+reachable by SHA until they garbage-collect. Rotate first, redact second.
+
 ### Examples
 
 ```bash

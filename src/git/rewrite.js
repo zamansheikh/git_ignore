@@ -48,7 +48,9 @@ function run(cmd, cwd, { silent = false, failOk = false } = {}) {
 
 function cmdExists(name) {
   try {
-    return spawnSync(name, ['--version'], { shell: true, stdio: 'pipe' }).status === 0;
+    // shell:false — args go straight to the binary, so there is nothing to
+    // escape (shell:true + args is deprecated and injection-prone).
+    return spawnSync(name, ['--version'], { stdio: 'pipe' }).status === 0;
   } catch { return false; }
 }
 
