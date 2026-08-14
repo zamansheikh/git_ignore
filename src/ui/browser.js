@@ -1,58 +1,88 @@
 'use strict';
 
 /**
- * Terminal UI File/Directory Browser
- * Keyboard controls:
- *   ↑/↓ or j/k  – navigate
- *   →/Enter      – open directory  |  confirm selection
- *   ←/Backspace  – go up one directory
- *   Space        – toggle file selection (multi-select)
- *   /            – search/filter
- *   Escape       – clear search
- *   a            – select all tracked files in current view
- *   u            – deselect all
- *   q / Ctrl+C   – quit
+ * File picker.
+ *
+ * Two ways to find a file, because people look for files in two different
+ * ways. Browse mode walks the directory tree the way a file manager does.
+ * Search mode (press `s`) ignores the tree entirely and fuzzy-matches against
+ * every path git has ever tracked — which is how you actually find `.env` in a
+ * repo you don't know by heart.
+ *
+ * Selection is a checkbox list with a live tray of what you have picked, so
+ * "what am I about to destroy" is never more than a glance away.
  */
 
 const fs = require('fs');
 const path = require('path');
-const readline = require('readline');
 const chalk = require('chalk');
 
-const PAGE_SIZE = Math.max(3, (process.stdout.rows || 25) - 12);
+const { theme, G, fit, keyHints, chrome, scrollbar } = require('./tui');
+const { BODY_TOP, reflow, twoCol } = require('./ui');
+
+const TRAY_ROWS = 4;
+
+/** Human-readable file size, or '' for anything we couldn't stat. */
+function humanSize(bytes) {
+  if (bytes == null) return '';
+  if (bytes < 1024) return `${bytes} B`;
+  if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
+  return `${(bytes / 1024 / 1024).toFixed(1)} MB`;
+}
+
+/** Subsequence match, so "senv" finds "src/.env". Returns a score, or -1. */
+function fuzzyScore(haystack, needle) {
+  if (!needle) return 0;
+  const h = haystack.toLowerCase();
+  const n = needle.toLowerCase();
+  const direct = h.indexOf(n);
+  if (direct >= 0) return 1000 - direct;      // contiguous wins outright
+
+  let score = 0;
+  let at = 0;
+  for (const ch of n) {
+    const found = h.indexOf(ch, at);
+    if (found < 0) return -1;
+    score += found === at ? 3 : 1;
+    at = found + 1;
+  }
+  return score;
+}
 
 class FileBrowser {
-  constructor(options = {}) {
-    this.root      = options.root || process.cwd();
-    this.cwd       = this.root;
-    this.entries   = [];
-    this.cursor    = 0;
-    this.scroll    = 0;
-    this.search    = '';
-    this.searching = false;
-    this.selected  = new Set();          // Set of repo-relative paths
-    this.gitFiles  = options.gitFiles || null;
-    this.onSelect  = options.onSelect || (() => {});
-    this.onCancel  = options.onCancel || (() => {});
-    this.title     = options.title || 'Select File(s) to Vanish from Git History';
+  /**
+   * @param {object} o
+   * @param {string}   o.root      repo root
+   * @param {string[]} o.gitFiles  every path git has tracked (null = unknown)
+   */
+  constructor(o = {}) {
+    this.root = o.root || process.cwd();
+    this.gitFiles = o.gitFiles || null;
+    this.trackedSet = new Set(this.gitFiles || []);
+    this.title = o.title || 'Select file(s) to vanish from history';
+    this.crumb = o.crumb || 'Vanish files';
+
+    this.cwd = this.root;
+    this.mode = 'browse';        // 'browse' | 'search'
+    this.query = '';
+    this.filter = '';
+    this.filtering = false;
+    this.cursor = 0;
+    this.offset = 0;
+    this.selected = new Set();   // repo-relative paths
+    this.flash = null;
+
+    this._load();
   }
 
-  /* ─── public ─────────────────────────────────────────────── */
+  /* ─── data ─────────────────────────────────────────────── */
 
-  start() {
-    this._loadEntries();
-    this._setupRaw();
-    this._render();
-  }
-
-  /* ─── directory loading ──────────────────────────────────── */
-
-  _loadEntries() {
+  _load() {
     let names;
-    try { names = fs.readdirSync(this.cwd); }
-    catch { names = []; }
+    try { names = fs.readdirSync(this.cwd); } catch { names = []; }
 
-    const dirs = [], files = [];
+    const dirs = [];
+    const files = [];
 
     for (const name of names) {
       if (name === '.git') continue;
@@ -60,252 +90,283 @@ class FileBrowser {
       let stat;
       try { stat = fs.statSync(full); } catch { continue; }
 
-      const entry = { name, full, isDir: stat.isDirectory() };
+      const rel = path.relative(this.root, full).replace(/\\/g, '/');
       if (stat.isDirectory()) {
-        dirs.push(entry);
+        dirs.push({ name, full, rel, isDir: true });
       } else {
-        entry.rel = path.relative(this.root, full).replace(/\\/g, '/');
-        if (this.gitFiles) {
-          entry.tracked = this.gitFiles.includes(entry.rel);
-        } else {
-          entry.tracked = true;
-        }
-        files.push(entry);
+        files.push({
+          name, full, rel,
+          isDir: false,
+          size: stat.size,
+          tracked: this.gitFiles ? this.trackedSet.has(rel) : true,
+        });
       }
     }
 
     dirs.sort((a, b) => a.name.localeCompare(b.name));
     files.sort((a, b) => a.name.localeCompare(b.name));
 
-    this.entries = [
-      { name: '..', full: path.dirname(this.cwd), isDir: true, isUp: true },
-      ...dirs,
-      ...files,
-    ];
-    this.cursor = 0;
-    this.scroll = 0;
+    this.entries = this.cwd === this.root
+      ? [...dirs, ...files]
+      : [{ name: '..', full: path.dirname(this.cwd), isDir: true, isUp: true }, ...dirs, ...files];
+
+    // Skip past ".." so opening a folder lands on its contents. Going back up
+    // is one ← away and does not need the cursor parked on it.
+    this.cursor = this.entries.length > 1 && this.entries[0].isUp ? 1 : 0;
+    this.offset = 0;
   }
 
-  _filtered() {
-    if (!this.search) return this.entries;
-    const q = this.search.toLowerCase();
+  /** Rows currently on screen, for whichever mode we are in. */
+  _rows() {
+    if (this.mode === 'search') {
+      const pool = this.gitFiles || [];
+      const scored = [];
+      for (const rel of pool) {
+        const score = fuzzyScore(rel, this.query);
+        if (score >= 0) scored.push({ rel, score });
+      }
+      scored.sort((a, b) => b.score - a.score || a.rel.localeCompare(b.rel));
+      return scored.slice(0, 500).map(({ rel }) => ({
+        name: rel,
+        rel,
+        isDir: false,
+        tracked: true,
+        full: path.join(this.root, rel),
+        fromSearch: true,
+      }));
+    }
+
+    if (!this.filter) return this.entries;
+    const q = this.filter.toLowerCase();
     return this.entries.filter((e) => e.isUp || e.name.toLowerCase().includes(q));
   }
 
-  /* ─── rendering ──────────────────────────────────────────── */
+  /* ─── rendering ────────────────────────────────────────── */
 
-  _render() {
-    const W = process.stdout.columns || 80;
-    const list = this._filtered();
+  frame(screen) {
+    const W = screen.width;
+    const rows = this._rows();
+    const height = Math.max(3, screen.height - 8 - TRAY_ROWS);
+    this.offset = reflow(this.cursor, rows.length, height, this.offset);
+    this.cursor = Math.max(0, Math.min(this.cursor, Math.max(0, rows.length - 1)));
 
-    if (this.cursor < this.scroll) this.scroll = this.cursor;
-    if (this.cursor >= this.scroll + PAGE_SIZE) this.scroll = this.cursor - PAGE_SIZE + 1;
+    const bar = scrollbar(rows.length, height, this.offset);
+    const inner = W - 6;
+    const body = [];
 
-    const lines = [];
-
-    // ── header ──
-    lines.push('');
-    lines.push(chalk.bold.cyan(' ┌' + '─'.repeat(W - 3) + '┐'));
-    lines.push(chalk.bold.cyan(' │') + chalk.bold.white(` ${this.title}`.padEnd(W - 3)) + chalk.bold.cyan('│'));
-    lines.push(chalk.bold.cyan(' │') + chalk.gray(` 📂 ${this.cwd}`.slice(0, W - 4).padEnd(W - 3)) + chalk.bold.cyan('│'));
-
-    // selected badge row
-    const badge = this.selected.size > 0
-      ? chalk.bgGreen.black(` ✔ ${this.selected.size} file${this.selected.size > 1 ? 's' : ''} selected `)
-      : chalk.gray(' No files selected yet ');
-    lines.push(chalk.bold.cyan(' │') + (' ' + badge).padEnd(W - 3) + chalk.bold.cyan('│'));
-    lines.push(chalk.bold.cyan(' └' + '─'.repeat(W - 3) + '┘'));
-    lines.push('');
-
-    // ── entries ──
-    const visible = list.slice(this.scroll, this.scroll + PAGE_SIZE);
-    for (let i = 0; i < visible.length; i++) {
-      const e        = visible[i];
-      const idx      = i + this.scroll;
-      const active   = idx === this.cursor;
-      const isChosen = !e.isDir && !e.isUp && this.selected.has(e.rel);
-
-      let icon, label, color;
-
-      if (e.isUp) {
-        icon  = '  ';
-        label = '↩  ..';
-        color = active ? chalk.bgBlue.bold : chalk.gray;
-      } else if (e.isDir) {
-        icon  = '📁';
-        label = e.name + '/';
-        color = active ? chalk.bgBlue.bold : chalk.yellow;
-      } else {
-        icon  = e.tracked ? '📄' : '🔒';
-        label = e.name;
-        if (isChosen)      color = active ? chalk.bgGreen.black.bold : chalk.green.bold;
-        else if (active)   color = e.tracked ? chalk.bgRed.bold     : chalk.bgGray.bold;
-        else               color = e.tracked ? chalk.white          : chalk.gray;
-      }
-
-      let prefix;
-      if (active && isChosen) prefix = chalk.bgGreen.black(' ▶✔');
-      else if (active)        prefix = chalk.bgBlue.white(' ▶ ');
-      else if (isChosen)      prefix = chalk.green(' ✔ ');
-      else                    prefix = '   ';
-
-      lines.push(prefix + icon + ' ' + color(label));
-    }
-
-    if (list.length > PAGE_SIZE) {
-      lines.push(chalk.gray(` ░ ${this.scroll + 1}–${Math.min(this.scroll + PAGE_SIZE, list.length)} / ${list.length} entries`));
-    }
-
-    // ── footer hint ──
-    lines.push('');
-    if (this.searching) {
-      lines.push(chalk.bgYellow.black(` 🔍 Filter: ${this.search}_  (Enter to apply, Esc to clear)`));
-    } else if (this.selected.size > 0) {
-      lines.push(
-        chalk.bgGreen.black(` [Enter] Confirm ${this.selected.size} selected file(s) `) + '  ' +
-        chalk.gray('[Space] toggle  [u] clear all  [q] quit')
-      );
+    if (rows.length === 0) {
+      body.push('');
+      body.push('   ' + theme.dim(this.mode === 'search'
+        ? 'No tracked file matches that search.'
+        : 'Nothing here.'));
+      for (let i = 2; i < height; i++) body.push('');
     } else {
-      lines.push(chalk.gray(
-        ' [↑↓/jk] move  [Space] select  [Enter/→] quick-select  [←] up  [/] filter  [a] all  [q] quit'
-      ));
+      rows.slice(this.offset, this.offset + height).forEach((e, i) => {
+        const idx = i + this.offset;
+        const active = idx === this.cursor;
+        const chosen = !e.isDir && this.selected.has(e.rel);
+
+        let icon;
+        let label;
+        let detail = '';
+
+        if (e.isUp) {
+          icon = '↩ ';
+          label = '..';
+          detail = 'parent folder';
+        } else if (e.isDir) {
+          icon = '📁';
+          label = e.name + '/';
+        } else {
+          icon = e.tracked ? '📄' : '🔒';
+          label = e.name;
+          detail = e.tracked
+            ? (e.fromSearch ? 'tracked' : humanSize(e.size))
+            : 'not tracked';
+        }
+
+        const box = e.isDir ? '   ' : (chosen ? `[${G.check}]` : '[ ]');
+        const row = twoCol(`${icon} ${label}`, detail, inner - 4);
+
+        let painted;
+        if (active)          painted = theme.selected(row);
+        else if (chosen)     painted = theme.chosen(row);
+        else if (e.isDir)    painted = theme.warn(row);
+        else if (!e.tracked) painted = theme.dim(row);
+        else                 painted = chalk.white(row);
+
+        const marker = active ? theme.accent(G.cursor) : ' ';
+        const check = chosen ? theme.chosen(box) : theme.dim(box);
+        body.push(` ${marker} ${check} ${painted}${bar[i] || ''}`);
+      });
     }
-    lines.push('');
 
-    process.stdout.write('\x1b[2J\x1b[H' + lines.join('\n') + '\n');
-  }
+    // ── selection tray ──
+    body.push(' ' + theme.rule('─'.repeat(Math.max(0, W - 2))));
+    const picks = [...this.selected];
+    if (picks.length === 0) {
+      body.push(' ' + theme.dim(' Nothing selected — Space ticks a file, Enter takes the one under the cursor.'));
+      body.push('');
+    } else {
+      const chips = picks.slice(0, 3).map((p) => theme.chosen.inverse(` ${path.basename(p)} `)).join(' ');
+      const more = picks.length > 3 ? theme.dim(`  +${picks.length - 3} more`) : '';
+      body.push(' ' + theme.ok(` ${picks.length} file(s) queued: `) + chips + more);
+      body.push(' ' + theme.dim(' ' + fit(picks.join('  ·  '), W - 4)));
+    }
 
-  /* ─── keyboard handling ──────────────────────────────────── */
+    // ── search / filter line ──
+    if (this.mode === 'search') {
+      body.push(' ' + theme.accent.inverse(' SEARCH ') + ' '
+        + chalk.white(this.query) + chalk.inverse(' ')
+        + theme.dim(`   ${rows.length} match(es) across all tracked files`));
+    } else if (this.filtering) {
+      body.push(' ' + theme.warn.inverse(' FILTER ') + ' '
+        + chalk.white(this.filter) + chalk.inverse(' ')
+        + theme.dim('   Enter to keep, Esc to clear'));
+    } else if (this.flash) {
+      body.push(' ' + this.flash);
+    } else {
+      body.push('');
+    }
 
-  _setupRaw() {
-    readline.emitKeypressEvents(process.stdin);
-    if (process.stdin.isTTY) process.stdin.setRawMode(true);
-    process.stdin.on('keypress', (ch, key) => {
-      if (!key) return;
-      if (this.searching) this._handleSearch(ch, key);
-      else                this._handleNav(ch, key);
+    const where = this.mode === 'search'
+      ? theme.accent('searching all tracked files')
+      : theme.dim('📂 ' + (path.relative(this.root, this.cwd) || '.'));
+
+    const help = this.mode === 'search'
+      ? keyHints([['type', 'to search'], ['space', 'tick'], ['enter', 'go'], ['esc', 'browse']])
+      : this.filtering
+        ? keyHints([['type', 'to filter'], ['enter', 'keep'], ['esc', 'clear']])
+        : keyHints([
+            ['↑↓', 'move'], ['→', 'open'], ['←', 'up'], ['space', 'tick'],
+            ['s', 'search all'], ['enter', 'continue'], ['esc', 'quit'],
+          ]);
+
+    return chrome(screen, {
+      title: this.title,
+      crumb: this.crumb,
+      right: path.basename(this.root),
+      status: where,
+      body,
+      help,
     });
   }
 
-  _handleSearch(ch, key) {
-    if (key.name === 'escape') {
-      this.search = ''; this.searching = false; this.cursor = 0;
-    } else if (key.name === 'return') {
-      this.searching = false; this.cursor = 0;
-    } else if (key.name === 'backspace') {
-      this.search = this.search.slice(0, -1);
-    } else if (ch && !key.ctrl) {
-      this.search += ch; this.cursor = 0;
-    }
-    this._render();
-  }
+  /* ─── input ────────────────────────────────────────────── */
 
-  _handleNav(ch, key) {
-    const list  = this._filtered();
-    const entry = list[this.cursor];
+  onKey(ev, api) {
+    this.flash = null;
+    const rows = this._rows();
+    const entry = rows[this.cursor];
+    const k = ev.name;
 
-    // ── movement ──────────────────────────────────────────────
-    if (key.name === 'up' || key.name === 'k') {
-      this.cursor = Math.max(0, this.cursor - 1);
-
-    } else if (key.name === 'down' || key.name === 'j') {
-      this.cursor = Math.min(list.length - 1, this.cursor + 1);
-
-    } else if (key.name === 'pageup') {
-      this.cursor = Math.max(0, this.cursor - PAGE_SIZE);
-
-    } else if (key.name === 'pagedown') {
-      this.cursor = Math.min(list.length - 1, this.cursor + PAGE_SIZE);
-
-    } else if (key.name === 'home') {
-      this.cursor = 0;
-
-    } else if (key.name === 'end') {
-      this.cursor = list.length - 1;
-
-    // ── go up a directory ──────────────────────────────────────
-    } else if (key.name === 'left' || key.name === 'backspace') {
-      if (this.cwd !== this.root) {
-        this.cwd = path.dirname(this.cwd);
-        this._loadEntries();
-      }
-
-    // ── Space = toggle file selection ──────────────────────────
-    } else if (ch === ' ') {
-      if (entry && !entry.isDir && !entry.isUp) {
-        if (this.gitFiles && !entry.tracked) {
-          this._flash(chalk.red(' ✘  Not git-tracked. Only tracked files can be vanished.'));
-          return;
-        }
-        if (this.selected.has(entry.rel)) this.selected.delete(entry.rel);
-        else                              this.selected.add(entry.rel);
-        // auto-advance so user can quickly Space through a list
-        this.cursor = Math.min(list.length - 1, this.cursor + 1);
-      }
-
-    // ── Enter / → = open dir OR confirm ───────────────────────
-    } else if (key.name === 'right' || key.name === 'return') {
-      if (!entry) { if (this.selected.size > 0) return this._confirm(); return this._render(); }
-
-      if (entry.isDir) {
-        // open directory
-        this.cwd = entry.full;
-        this._loadEntries();
-      } else {
-        // file
-        if (this.gitFiles && !entry.tracked) {
-          this._flash(chalk.red(' ✘  Not git-tracked. Cannot vanish this file.'));
-          return;
-        }
-        // Add current file to selection (if not already) then confirm everything
-        this.selected.add(entry.rel);
-        this._confirm();
+    // Text-entry modes swallow printable keys.
+    if (this.mode === 'search' || this.filtering) {
+      if (k === 'escape') {
+        if (this.mode === 'search') { this.mode = 'browse'; this.query = ''; this._load(); }
+        else { this.filtering = false; this.filter = ''; this.cursor = 0; }
         return;
       }
-
-    // ── a = select ALL tracked files in current view ───────────
-    } else if (ch === 'a') {
-      for (const e of list) {
-        if (!e.isDir && !e.isUp && e.tracked) this.selected.add(e.rel);
+      if (k === 'backspace') {
+        if (this.mode === 'search') this.query = this.query.slice(0, -1);
+        else this.filter = this.filter.slice(0, -1);
+        this.cursor = 0;
+        return;
       }
-
-    // ── u = deselect all ──────────────────────────────────────
-    } else if (ch === 'u') {
-      this.selected.clear();
-
-    // ── / = search ────────────────────────────────────────────
-    } else if (ch === '/') {
-      this.searching = true;
-      this.search    = '';
-
-    // ── q / Ctrl+C = quit ─────────────────────────────────────
-    } else if (ch === 'q' || (key.ctrl && key.name === 'c')) {
-      this._cleanup();
-      this.onCancel();
-      return;
+      if (k === 'return' && this.filtering) { this.filtering = false; return; }
+      if (!ev.ctrl && !ev.meta && ev.ch && ev.ch >= ' ' && k !== 'return') {
+        if (this.mode === 'search') this.query += ev.ch;
+        else this.filter += ev.ch;
+        this.cursor = 0;
+        return;
+      }
+      // Everything else (arrows, Enter in search mode) falls through to
+      // navigation, so you can type and move without leaving the search.
     }
 
-    this._render();
+    if (k === 'up' || (k === 'k' && this.mode === 'browse' && !this.filtering))
+      this.cursor = Math.max(0, this.cursor - 1);
+    else if (k === 'down' || (k === 'j' && this.mode === 'browse' && !this.filtering))
+      this.cursor = Math.min(rows.length - 1, this.cursor + 1);
+    else if (k === 'pageup')   this.cursor = Math.max(0, this.cursor - 10);
+    else if (k === 'pagedown') this.cursor = Math.min(rows.length - 1, this.cursor + 10);
+    else if (k === 'home')     this.cursor = 0;
+    else if (k === 'end')      this.cursor = rows.length - 1;
+
+    else if (k === 'left' || k === 'backspace') {
+      if (this.mode === 'browse' && this.cwd !== this.root) {
+        const leaving = this.cwd;
+        this.cwd = path.dirname(this.cwd);
+        this._load();
+        // Land on the folder we just came out of, not at the top.
+        const back = this._rows().findIndex((e) => e.full === leaving);
+        if (back >= 0) this.cursor = back;
+      }
+    }
+
+    else if (ev.ch === ' ') this._toggle(entry, rows);
+
+    else if (k === 'right') {
+      if (entry && entry.isDir) { this.cwd = entry.full; this._load(); }
+      else this._toggle(entry, rows);
+    }
+
+    else if (k === 'return') {
+      if (entry && entry.isDir) { this.cwd = entry.full; this._load(); return; }
+      // Enter is the fast path: take what is under the cursor and go.
+      if (entry && !entry.isDir) {
+        if (!this._selectable(entry)) return;
+        this.selected.add(entry.rel);
+      }
+      if (this.selected.size > 0) return api.done([...this.selected]);
+      this.flash = theme.warn('Nothing selected yet.');
+    }
+
+    else if (this.mode === 'browse' && !this.filtering) {
+      if (ev.ch === 's') { this.mode = 'search'; this.query = ''; this.cursor = 0; this.offset = 0; }
+      else if (ev.ch === '/') { this.filtering = true; this.filter = ''; this.cursor = 0; }
+      else if (ev.ch === 'a') {
+        for (const e of rows) if (!e.isDir && e.tracked) this.selected.add(e.rel);
+      } else if (ev.ch === 'n' || ev.ch === 'u') this.selected.clear();
+      else if (k === 'escape' || ev.ch === 'q') api.done(null);
+    }
   }
 
-  /* ─── confirm and exit ───────────────────────────────────── */
+  onMouse(ev, api) {
+    const rows = this._rows();
+    if (ev.wheel === 'up')   return void (this.cursor = Math.max(0, this.cursor - 3));
+    if (ev.wheel === 'down') return void (this.cursor = Math.min(rows.length - 1, this.cursor + 3));
+    if (!ev.pressed) return;
 
-  _confirm() {
-    if (this.selected.size === 0) return this._render();
-    const files = Array.from(this.selected);
-    this._cleanup();
-    this.onSelect(files);
+    const idx = ev.y - BODY_TOP + this.offset;
+    if (idx < 0 || idx >= rows.length) return;
+    const entry = rows[idx];
+    this.cursor = idx;
+
+    // Clicking a folder opens it; clicking a file ticks it. Matches the
+    // single-click habits of a file dialog.
+    if (entry.isDir) {
+      this.cwd = entry.full;
+      this._load();
+    } else {
+      this._toggle(entry, rows);
+    }
   }
 
-  _flash(msg) {
-    this._render();
-    process.stdout.write('\n' + msg + '\n');
-    setTimeout(() => this._render(), 1400);
+  _selectable(entry) {
+    if (!entry || entry.isDir) return false;
+    if (this.gitFiles && !entry.tracked) {
+      this.flash = theme.danger(`${G.cursor} "${entry.name}" is not tracked by git — there is nothing in history to remove.`);
+      return false;
+    }
+    return true;
   }
 
-  _cleanup() {
-    if (process.stdin.isTTY) process.stdin.setRawMode(false);
-    process.stdin.pause();
+  _toggle(entry, rows) {
+    if (!this._selectable(entry)) return;
+    if (this.selected.has(entry.rel)) this.selected.delete(entry.rel);
+    else this.selected.add(entry.rel);
+    this.cursor = Math.min(rows.length - 1, this.cursor + 1);
   }
 }
 

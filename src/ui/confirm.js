@@ -1,9 +1,14 @@
 'use strict';
 
 /**
- * Terminal confirmation prompt with keyboard support.
- * Single keypress: y/Y → confirm    n/N/Escape/Enter/q/Ctrl+C → deny
- * No Enter required.
+ * A single-keypress yes/no prompt for the plain terminal.
+ *
+ * The wizards ask their questions with the full-screen dialog in `ui.js`. This
+ * one is for the questions that come AFTER a rewrite, once we have handed the
+ * terminal back — "shall I put your remote back?" belongs in the scrollback
+ * next to the commands it relates to, not in a screen that erases itself.
+ *
+ * y/Y confirms; n/N/Escape/Enter/q/Ctrl+C denies. No Enter required.
  */
 
 const readline = require('readline');
@@ -11,6 +16,15 @@ const chalk    = require('chalk');
 
 function confirm(question) {
   return new Promise((resolve) => {
+    // Without a terminal there is nobody to answer. Treat silence as "no":
+    // every caller's question guards an action, so defaulting to yes would
+    // let a piped or CI run take a step the user never approved.
+    if (!process.stdin.isTTY) {
+      process.stdout.write(chalk.gray(`\n ⚠️  ${question}  [skipped — not a terminal]\n`));
+      resolve(false);
+      return;
+    }
+
     process.stdout.write(
       chalk.bold.yellow('\n ⚠️  ') + chalk.bold(question) +
       chalk.gray('  [y/N] ') + chalk.white('→ ')
@@ -47,30 +61,4 @@ function confirm(question) {
   });
 }
 
-/**
- * Show a styled warning box
- */
-function warnBox(lines) {
-  const W = process.stdout.columns || 80;
-  const bar = chalk.red('─'.repeat(W - 2));
-  console.log(chalk.red('\n┌' + bar + '┐'));
-  for (const line of lines) {
-    console.log(chalk.red('│') + ' ' + line);
-  }
-  console.log(chalk.red('└' + bar + '┘\n'));
-}
-
-/**
- * Show a success box
- */
-function successBox(lines) {
-  const W = process.stdout.columns || 80;
-  const bar = chalk.green('─'.repeat(W - 2));
-  console.log(chalk.green('\n┌' + bar + '┐'));
-  for (const line of lines) {
-    console.log(chalk.green('│') + ' ' + line);
-  }
-  console.log(chalk.green('└' + bar + '┘\n'));
-}
-
-module.exports = { confirm, warnBox, successBox };
+module.exports = { confirm };

@@ -40,8 +40,13 @@ function run(cmd, cwd, { silent = false, failOk = false } = {}) {
   });
 
   if (res.status !== 0 && !failOk) {
-    const err = res.stderr ? res.stderr.toString() : '';
-    throw new Error(err || `Command failed: ${cmd}`);
+    // Both streams: git-filter-repo reports several fatal conditions on stdout,
+    // and an error message that says only "Command failed" helps nobody.
+    const detail = [res.stdout, res.stderr]
+      .map((b) => (b ? b.toString().trim() : ''))
+      .filter(Boolean)
+      .join('\n');
+    throw new Error(detail || `Command failed: ${cmd}`);
   }
   return res.stdout ? res.stdout.toString().trim() : '';
 }
@@ -154,7 +159,10 @@ function addToGitignore(repoPath, filePath) {
 async function rewriteWithFilterRepo(repoPath, filePath, onProgress) {
   onProgress('Using git filter-repo (fast path)…');
   const gitPath = filePath.replace(/\\/g, '/').replace(/\/$/, '');
-  run(`git filter-repo --force --path "${gitPath}" --invert-paths`, repoPath);
+  // Captured, not inherited: this runs under a spinner, and filter-repo's
+  // progress counters redraw over it. Failures still surface via the thrown
+  // error, which now carries both streams.
+  run(`git filter-repo --force --path "${gitPath}" --invert-paths`, repoPath, { silent: true });
   onProgress('git filter-repo complete.');
 }
 
@@ -169,7 +177,8 @@ async function rewriteWithFilterBranch(repoPath, filePath, onProgress) {
 
   run(
     `git filter-branch --force --index-filter "${indexFilter}" --prune-empty --tag-name-filter cat -- --all`,
-    repoPath
+    repoPath,
+    { silent: true }
   );
   onProgress('filter-branch complete.');
 }
@@ -185,10 +194,10 @@ async function cleanup(repoPath, onProgress) {
   }
 
   onProgress('Expiring reflogs…');
-  run('git reflog expire --expire=now --all', repoPath, { failOk: true });
+  run('git reflog expire --expire=now --all', repoPath, { failOk: true, silent: true });
 
   onProgress('Running garbage collection…');
-  run('git gc --prune=now --aggressive', repoPath, { failOk: true });
+  run('git gc --prune=now --aggressive', repoPath, { failOk: true, silent: true });
 }
 
 /* ─── main export ──────────────────────────────────────────── */

@@ -1,7 +1,7 @@
 {
   "name": "git-vanish",
-  "version": "1.4.0",
-  "description": "Vanish sensitive files from all git commit history, redact a leaked secret from every commit, or reassign a contributor's commits to someone else.",
+  "version": "1.5.0",
+  "description": "Interactive terminal app to vanish sensitive files from all git commit history, redact a leaked secret from every commit, or reassign a contributor commits to someone else.",
   "bin": {
     "git-vanish": "bin/git-vanish.js"
   },
@@ -39,7 +39,13 @@
     "author",
     "mailmap",
     "attribution",
-    "contributor"
+    "contributor",
+    "interactive",
+    "wizard",
+    "mouse",
+    "reassign",
+    "backup",
+    "bundle"
   ],
   "author": "zamansheikh",
   "license": "MIT",

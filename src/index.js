@@ -1,34 +1,31 @@
 'use strict';
 
 /**
- * git-vanish – main orchestrator
+ * git-vanish — entry point.
  *
- * Flow:
- *  1. Locate git repo root (from cwd or --repo flag)
- *  2. Fetch all git-tracked files for the file browser
- *  3. Open interactive TUI browser  →  user selects a file
- *  4. Show which commits contain the file
- *  5. Prompt for final confirmation  →  run scrub
- *  6. Print force-push instructions
+ * Two ways in, one implementation underneath.
+ *
+ * With no arguments you get the interactive app: a home screen, then a wizard
+ * for whichever operation you pick. That is the path most people want, because
+ * the hard part of history rewriting is not running the command — it is
+ * knowing exactly what the command is about to do to your repository.
+ *
+ * With flags you get the same operations non-interactively, for scripts and
+ * for people who already know what they want. Anything destructive still
+ * refuses to start on a dirty working tree, still reports its scope first, and
+ * still verifies the result afterwards.
  */
 
-const path     = require('path');
-const fs       = require('fs');
-const chalk    = require('chalk');
-const { spawnSync } = require('child_process');
+const path = require('path');
+const fs = require('fs');
+const chalk = require('chalk');
 const { program } = require('commander');
-const simpleGit   = require('simple-git');
 
-function run(cmd, cwd) {
-  spawnSync(cmd, { cwd, shell: true, stdio: 'pipe' });
-}
-
-const FileBrowser = require('./ui/browser');
-const { confirm, warnBox, successBox } = require('./ui/confirm');
-const { getAllTrackedFiles, findCommitsForFile, getRemoteBranches, getRemoteUrl } = require('./git/history');
-const { scrubFile, addToGitignore } = require('./git/rewrite');
-const { redactSecrets, maskSecret } = require('./git/redact');
-const { reassignAuthors, listAuthors } = require('./git/reassign');
+const { redactSecrets } = require('./git/redact');
+const {
+  reassignAuthors, listAuthors, parseMapping, captureRemotes,
+} = require('./git/reassign');
+const { runApp, vanishFlow, repoStats, dirtyFiles } = require('./ui/flows');
 
 /* ─── CLI setup ──────────────────────────────────────────── */
 
@@ -36,14 +33,16 @@ program
   .name('git-vanish')
   // Read from package.json so --version can never drift from the published release.
   .version(require('../package.json').version)
+  .argument('[mode]', 'jump straight to a screen: vanish | redact | reassign | authors')
   .description(
-    'Interactively browse your repo and permanently vanish a sensitive\n' +
-    'file from all git commit history — file preserved on disk as untracked.\n' +
-    'Or use --secret to redact a leaked string from every commit while\n' +
-    'keeping the file that contained it tracked.'
+    'Interactively browse your repo and permanently vanish a sensitive file\n' +
+    'from all git commit history — the file is preserved on disk as untracked.\n' +
+    'Or redact a leaked string from every commit while keeping the file that\n' +
+    'contained it, or reassign a contributor\'s commits to another identity.\n\n' +
+    'Run with no arguments for the interactive app.'
   )
   .option('-r, --repo <path>',  'Path to the git repository (default: cwd)')
-  .option('-f, --file <path>',  'Repo-relative file path to scrub (skip the browser)')
+  .option('-f, --file <path>',  'Repo-relative file path to vanish (skip the browser)')
   .option('--no-gc',             'Skip the garbage collection step (faster, less thorough)')
   .option('--dry-run',           'Show what would happen without changing anything')
   // Redaction mode — for a secret embedded in a file you need to KEEP.
@@ -72,12 +71,13 @@ program
   .parse(process.argv);
 
 const opts = program.opts();
+const mode = (program.args[0] || '').toLowerCase();
 
 /* ─── helpers ────────────────────────────────────────────── */
 
-async function findRepoRoot(startPath) {
+function findRepoRoot(startPath) {
   let current = path.resolve(startPath);
-  while (true) {
+  for (;;) {
     if (fs.existsSync(path.join(current, '.git'))) return current;
     const parent = path.dirname(current);
     if (parent === current) return null;
@@ -85,319 +85,195 @@ async function findRepoRoot(startPath) {
   }
 }
 
-function printBanner() {
-  const W = process.stdout.columns || 80;
-  console.log(chalk.bold.red('\n' + '═'.repeat(W)));
-  console.log(chalk.bold.red('  🔥 git-vanish') + chalk.bold.white(' — Vanish sensitive files from git history'));
-  console.log(chalk.bold.red('═'.repeat(W)) + '\n');
+/** One line, not a wall — the interactive app has its own title bar. */
+function banner(repoPath) {
+  console.log(
+    '\n' + chalk.bold.hex('#ff6b3d')('🔥 git-vanish') +
+    chalk.gray(`  v${require('../package.json').version}  ·  ${repoPath}`)
+  );
 }
 
-function printCommitList(commits, filePath) {
-  console.log(chalk.bold.yellow(`\n Found ${commits.length} commit(s) that contain "${filePath}":\n`));
-  const shown = commits.slice(0, 20);
-  for (const c of shown) {
+function die(message, hint) {
+  console.error(chalk.red(`\n ✘  ${message}\n`));
+  if (hint) console.error(chalk.gray(`    ${hint}\n`));
+  process.exit(1);
+}
+
+/** Refuse to start a rewrite on top of uncommitted work. */
+function requireCleanTree(repoPath) {
+  if (opts.dryRun) return;
+  const dirty = dirtyFiles(repoPath);
+  if (dirty.length === 0) return;
+  die(
+    'Tracked files are modified.',
+    'History rewriting replays every commit — commit or stash first.'
+  );
+}
+
+function printPublishSteps(remotes) {
+  console.log(chalk.gray('\n  git-filter-repo removes remotes so a bad rewrite cannot be pushed by accident.'));
+  console.log(chalk.gray('  To publish this history:\n'));
+  if (remotes && remotes.length) {
+    for (const r of remotes) console.log(chalk.cyan(`    git remote add ${r.name} ${r.url}`));
+  } else {
+    console.log(chalk.cyan('    git remote add origin <your-remote-url>'));
+  }
+  console.log(chalk.cyan('    git push --force --all'));
+  console.log(chalk.cyan('    git push --force --tags\n'));
+}
+
+/* ─── non-interactive: list authors ──────────────────────── */
+
+function runListAuthors(repoPath) {
+  const people = listAuthors(repoPath);
+  console.log(chalk.bold(`\n ${people.length} identit${people.length === 1 ? 'y' : 'ies'} in history:\n`));
+
+  if (people.length === 0) {
+    console.log(chalk.gray('   No commits yet.\n'));
+    return;
+  }
+
+  const width = Math.max(...people.map((p) => `${p.name} <${p.email}>`.length));
+  console.log(chalk.gray(
+    '   ' + 'identity'.padEnd(width) + 'authored'.padStart(10) + 'committed'.padStart(12) + 'total'.padStart(8)
+  ));
+  for (const p of people) {
     console.log(
-      chalk.gray('  ') +
-      chalk.cyan(c.hash.slice(0, 8)) +
-      chalk.gray('  ' + c.date + '  ') +
-      chalk.white(c.message.slice(0, 60))
+      '   ' + `${p.name} <${p.email}>`.padEnd(width)
+      + chalk.cyan(String(p.authored).padStart(10))
+      + chalk.gray(String(p.committed).padStart(12))
+      + chalk.white(String(p.count).padStart(8))
     );
   }
-  if (commits.length > 20) {
-    console.log(chalk.gray(`  … and ${commits.length - 20} more`));
-  }
-  console.log('');
+  console.log(chalk.gray(
+    '\n  "committed" counts commits someone applied but did not write — rebases and squashed\n' +
+    '  merges leave these behind, and a reassignment has to catch them too.\n'
+  ));
+  console.log(chalk.gray('  Reassign with:  ') + chalk.cyan('git-vanish --reassign "Old <old@mail>=New <new@mail>"\n'));
 }
 
-function printForcePushInstructions(repoPath, remoteUrl) {
-  const W = process.stdout.columns || 80;
-  console.log('\n' + chalk.bold.magenta('─'.repeat(W)));
-  console.log(chalk.bold.magenta('\n  📡 IMPORTANT: Force-push to update the remote\n'));
-  console.log(chalk.white('  You MUST run these commands to clean the remote:\n'));
-  console.log(chalk.bold.yellow('    git push origin --force --all'));
-  console.log(chalk.bold.yellow('    git push origin --force --tags'));
-  console.log('');
+/* ─── non-interactive: reassign ──────────────────────────── */
 
-  if (remoteUrl) {
-    console.log(chalk.gray(`  Remote URL: ${remoteUrl}`));
-  }
+async function runReassign(repoPath) {
+  const pairs = opts.reassign.map((raw) => {
+    const parsed = parseMapping(raw);
+    if (!parsed) {
+      die(`Bad mapping: ${raw}`, 'Expected:  "Old Name <old@mail>=New Name <new@mail>"');
+    }
+    return parsed;
+  });
 
-  console.log(chalk.gray('\n  ⚠  All collaborators must re-clone or run:'));
-  console.log(chalk.gray('       git fetch --all'));
-  console.log(chalk.gray('       git reset --hard origin/<branch>'));
-  console.log('');
+  requireCleanTree(repoPath);
 
-  console.log(chalk.gray(
-    '  ⚠  If this repo is on GitHub, also rotate any leaked secrets\n' +
-    '     (tokens, passwords, keys) immediately — GitHub may cache content.'
-  ));
-  console.log('\n' + chalk.bold.magenta('─'.repeat(W)) + '\n');
+  console.log(chalk.bold(`\n Reassigning authorship on ${pairs.length} identit${pairs.length === 1 ? 'y' : 'ies'}:\n`));
+
+  const result = await reassignAuthors(
+    repoPath, pairs, { dryRun: opts.dryRun },
+    (msg) => console.log('   ' + msg)
+  );
+
+  if (!result.changed) return;
+
+  console.log(chalk.green(`\n  ✓  ${result.commits} commits kept, authorship moved.\n`));
+  console.log(chalk.gray('  Files, messages and dates are untouched — only the identity changed.'));
+  printPublishSteps(result.remotes);
+  console.log(chalk.gray('  Existing clones and forks keep the old identity until they re-clone.\n'));
+}
+
+/* ─── non-interactive: redact ────────────────────────────── */
+
+async function runRedact(repoPath, secrets) {
+  requireCleanTree(repoPath);
+
+  console.log(chalk.bold(`\n Redacting ${secrets.length} secret(s) from all history:\n`));
+  const remotes = captureRemotes(repoPath);
+
+  const result = await redactSecrets(
+    repoPath, secrets,
+    { replacement: opts.replacement, dryRun: opts.dryRun },
+    (msg) => console.log('   ' + msg)
+  );
+
+  if (!result.changed) return;
+
+  console.log(chalk.green('\n  ✓  Secret(s) removed from every commit.\n'));
+  printPublishSteps(remotes);
+  console.log(chalk.gray('  Everyone else must re-clone — their old clones still contain the secret.\n'));
 }
 
 /* ─── main ───────────────────────────────────────────────── */
 
 async function main() {
-  printBanner();
-
-  // ── 1. Find repo root ──────────────────────────────────
   const startDir = opts.repo ? path.resolve(opts.repo) : process.cwd();
-  const repoPath = await findRepoRoot(startDir);
+  const repoPath = findRepoRoot(startDir);
 
   if (!repoPath) {
-    console.error(chalk.red(`\n ✘  No git repository found at or above: ${startDir}\n`));
-    console.error(chalk.gray('    Run this command from inside a git repository, or use --repo <path>.\n'));
-    process.exit(1);
-  }
-
-  console.log(chalk.gray(` ✔  Repo root: ${repoPath}\n`));
-
-  // ── 1a. List authors ───────────────────────────────────
-  // Read-only, so it runs before every other mode and exits.
-  if (opts.listAuthors) {
-    const authors = listAuthors(repoPath);
-    console.log(chalk.bold(` ${authors.length} identit${authors.length === 1 ? 'y' : 'ies'} in history:\n`));
-    const width = Math.max(...authors.map((a) => `${a.name} <${a.email}>`.length));
-    for (const a of authors) {
-      const who = `${a.name} <${a.email}>`;
-      console.log(`   ${who.padEnd(width)}  ${String(a.count).padStart(6)} refs`);
-    }
-    console.log(chalk.gray('\n  "refs" counts author + committer entries, so a commit can count twice.'));
-    console.log(chalk.gray('  Reassign with:  git-vanish --reassign "Old <old@mail>=New <new@mail>"\n'));
-    return;
-  }
-
-  // ── 1b. Author reassignment ────────────────────────────
-  if (opts.reassign && opts.reassign.length > 0) {
-    const pairs = opts.reassign.map((raw) => {
-      const at = raw.indexOf('=');
-      if (at < 0) {
-        console.error(chalk.red(`\n ✘  Bad mapping: ${raw}`));
-        console.error(chalk.gray('    Expected:  "Old Name <old@mail>=New Name <new@mail>"\n'));
-        process.exit(1);
-      }
-      return { from: raw.slice(0, at), to: raw.slice(at + 1) };
-    });
-
-    const dirty = spawnSync('git', ['status', '--porcelain', '--untracked-files=no'], {
-      cwd: repoPath, stdio: 'pipe',
-    }).stdout.toString().trim();
-    if (dirty && !opts.dryRun) {
-      console.error(chalk.red('\n ✘  Tracked files are modified.\n'));
-      console.error(chalk.gray('    History rewriting rewrites every commit — commit or stash first.\n'));
-      process.exit(1);
-    }
-
-    console.log(chalk.bold(` Reassigning authorship on ${pairs.length} identit${pairs.length === 1 ? 'y' : 'ies'}:\n`));
-    const result = await reassignAuthors(repoPath, pairs, { dryRun: opts.dryRun },
-      (msg) => console.log('   ' + msg));
-
-    if (result.changed) {
-      console.log(chalk.yellow(`\n  History rewritten. Every commit hash has changed.\n`));
-      console.log(chalk.gray('  Files, messages and dates are untouched — only the identity moved.\n'));
-      console.log(chalk.cyan('    git remote add origin <your-remote-url>'));
-      console.log(chalk.cyan('    git push --force --all'));
-      console.log(chalk.cyan('    git push --force --tags\n'));
-      console.log(chalk.gray('  Existing clones and forks keep the old identity until they re-clone.\n'));
-    }
-    return;
-  }
-
-  // ── 1c. Redaction mode ─────────────────────────────────
-  // Runs instead of the file browser: the file stays tracked, only the
-  // secret's bytes are rewritten across every commit.
-  const inlineSecrets = opts.secret || [];
-  const fileSecrets = opts.secretsFile
-    ? fs.readFileSync(path.resolve(opts.secretsFile), 'utf8')
-        .split('\n').map((l) => l.trim()).filter((l) => l && !l.startsWith('#'))
-    : [];
-  const secrets = [...inlineSecrets, ...fileSecrets];
-
-  if (secrets.length > 0) {
-    const dirty = spawnSync('git', ['status', '--porcelain'], {
-      cwd: repoPath, stdio: 'pipe',
-    }).stdout.toString().trim();
-    if (dirty && !opts.dryRun) {
-      console.error(chalk.red('\n ✘  Working tree is not clean.\n'));
-      console.error(chalk.gray('    History rewriting rewrites every commit — commit or stash first.\n'));
-      process.exit(1);
-    }
-
-    console.log(chalk.bold(` Redacting ${secrets.length} secret(s) from all history:\n`));
-    const result = await redactSecrets(
-      repoPath, secrets,
-      { replacement: opts.replacement, dryRun: opts.dryRun },
-      (msg) => console.log('   ' + msg)
+    die(
+      `No git repository found at or above: ${startDir}`,
+      'Run this command from inside a git repository, or use --repo <path>.'
     );
+  }
 
-    if (result.changed) {
-      console.log(chalk.yellow(`\n  History rewritten. Every commit hash has changed.\n`));
-      console.log(chalk.gray('  filter-repo removes the remote as a safety measure. To publish:\n'));
-      console.log(chalk.cyan('    git remote add origin <your-remote-url>'));
-      console.log(chalk.cyan('    git push --force --all'));
-      console.log(chalk.cyan('    git push --force --tags\n'));
-      console.log(chalk.gray('  Everyone else must re-clone — their old clones still contain the secret.\n'));
+  // ── Non-interactive paths, in the order they short-circuit ──
+
+  if (opts.listAuthors) { banner(repoPath); return runListAuthors(repoPath); }
+  if (opts.reassign && opts.reassign.length > 0) { banner(repoPath); return runReassign(repoPath); }
+
+  const secrets = [
+    ...(opts.secret || []),
+    ...(opts.secretsFile
+      ? fs.readFileSync(path.resolve(opts.secretsFile), 'utf8')
+          .split('\n').map((l) => l.trim()).filter((l) => l && !l.startsWith('#'))
+      : []),
+  ];
+  if (secrets.length > 0) { banner(repoPath); return runRedact(repoPath, secrets); }
+
+  // ── Interactive from here on ──
+
+  if (!process.stdin.isTTY || !process.stdout.isTTY) {
+    die(
+      'The interactive app needs a terminal.',
+      'Use the flags instead — see: git-vanish --help'
+    );
+  }
+
+  const ctx = {
+    repoPath,
+    repoName: path.basename(repoPath),
+    dryRun: !!opts.dryRun,
+    stats: repoStats(repoPath),
+  };
+
+  // --file preselects the browser's result but keeps every review and
+  // confirmation screen: skipping the picker is not consent to a rewrite.
+  if (opts.file) {
+    const { Ui } = require('./ui/ui');
+    const ui = new Ui();
+    ui.open();
+    try {
+      const files = opts.file.split(',').map((f) => f.trim().replace(/\\/g, '/')).filter(Boolean);
+      await vanishFlow(ui, ctx, files);
+    } finally {
+      ui.close();
     }
     return;
   }
 
-  // ── 2. Load all git-tracked files (for the TUI) ────────
-  console.log(chalk.gray(' ⏳ Loading file list from git history…'));
-  let allTrackedFiles;
-  try {
-    allTrackedFiles = await getAllTrackedFiles(repoPath);
-  } catch (e) {
-    allTrackedFiles = null; // still show the browser, just without filtering
-  }
-
-  // ── 3. File selection ──────────────────────────────────
-  /** @type {string[]} */
-  let selectedFiles = [];
-
-  if (opts.file) {
-    // normalize slashes, allow comma-separated list
-    selectedFiles = opts.file.split(',').map((f) => f.trim().replace(/\\/g, '/'));
-    console.log(chalk.cyan(` ℹ  File(s) from --file flag: ${selectedFiles.join(', ')}\n`));
-  } else {
-    // Open the interactive TUI browser — returns string[]
-    selectedFiles = await new Promise((resolve, reject) => {
-      const browser = new FileBrowser({
-        root:      repoPath,
-        gitFiles:  allTrackedFiles,
-        title:     '  git-vanish — Select file(s) to vanish from history',
-        onSelect:  (files) => resolve(files),
-        onCancel:  () => reject(new Error('cancelled')),
-      });
-      browser.start();
-    }).catch((err) => {
-      if (err.message === 'cancelled') {
-        console.log(chalk.yellow('\n  Cancelled. No changes made.\n'));
-        process.exit(0);
-      }
-      throw err;
-    });
-  }
-
-  if (!selectedFiles || selectedFiles.length === 0) {
-    console.log(chalk.yellow('\n  No files selected.\n'));
-    process.exit(0);
-  }
-
-  // ── 4-7. Per-file: scan → confirm → scrub ─────────────
-  const ora = require('ora');
-  const scrubbedFiles = [];
-
-  for (const selectedFile of selectedFiles) {
-    console.log(chalk.bold.cyan(`\n ── Processing: ${selectedFile} ──`));
-
-    // 4. Show commits that contain the file
-    console.log(chalk.gray('\n ⏳ Searching git history…\n'));
-    const commits = await findCommitsForFile(repoPath, selectedFile);
-
-    if (commits.length === 0) {
-      console.log(chalk.yellow(` ⚠  "${selectedFile}" was not found in any commit — skipping.\n`));
-      continue;
+  if (mode) {
+    const known = { vanish: 1, redact: 1, reassign: 1, authors: 1, contributors: 1 };
+    if (!known[mode]) {
+      die(`Unknown mode: ${mode}`, 'Expected one of: vanish, redact, reassign, authors');
     }
-
-    printCommitList(commits, selectedFile);
-
-    // 5. Dry-run bail-out
-    if (opts.dryRun) {
-      console.log(chalk.bold.blue(` [DRY RUN] Would scrub "${selectedFile}" from ${commits.length} commit(s).\n`));
-      continue;
-    }
-
-    // 6. Warnings and per-file confirmation
-    const remoteUrl = await getRemoteUrl(repoPath);
-
-    warnBox([
-      chalk.bold.red('  WARNING: This operation rewrites git history.'),
-      '',
-      chalk.white(`  File to remove : `) + chalk.bold.red(selectedFile),
-      chalk.white(`  Affected commits: `) + chalk.bold.yellow(String(commits.length)),
-      chalk.white(`  Repository     : `) + chalk.gray(repoPath),
-      '',
-      chalk.yellow('  • ALL branches and tags that contain this file will be rewritten.'),
-      chalk.yellow('  • You will need to force-push to update any remote (GitHub etc.).'),
-      chalk.yellow('  • All collaborators must re-clone or reset their local copies.'),
-      chalk.yellow('  • Consider rotating any leaked secrets immediately.'),
-      '',
-      chalk.bold('  This CANNOT be undone unless you have a backup.'),
-    ]);
-
-    const ok = await confirm(`Permanently scrub "${selectedFile}" from all ${commits.length} commit(s)?`);
-
-    if (!ok) {
-      console.log(chalk.yellow(`\n  Skipped "${selectedFile}". No changes made for this file.\n`));
-      continue;
-    }
-
-    // 7. Run the scrub
-    const spinner = ora({ text: `Rewriting git history for ${selectedFile}…`, color: 'red' }).start();
-
-    let result;
-    try {
-      result = await scrubFile(repoPath, selectedFile, (msg) => {
-        spinner.text = chalk.gray(msg);
-      });
-      spinner.succeed(chalk.green(`Scrubbed "${selectedFile}" from git history.`));
-      scrubbedFiles.push({ file: selectedFile, method: result.method });
-    } catch (err) {
-      spinner.fail(chalk.red(`Scrub failed for "${selectedFile}".`));
-      console.error('\n' + chalk.red(err.message) + '\n');
-      console.error(chalk.gray(
-        ' Tip: Make sure you have no uncommitted changes before running git-vanish.\n' +
-        ' Run: git stash  then try again.\n'
-      ));
-    }
+    ctx.startAt = mode === 'contributors' ? 'authors' : mode;
   }
 
-  if (scrubbedFiles.length === 0) {
-    if (!opts.dryRun) console.log(chalk.yellow('\n  Nothing was scrubbed.\n'));
-    process.exit(0);
-  }
-
-  // ── 8. Opt-in: add scrubbed files to .gitignore ───────
-  const remoteUrl = await getRemoteUrl(repoPath);
-
-  const addToIgnore = await confirm(
-    `Add ${scrubbedFiles.length} scrubbed file(s) to .gitignore to prevent future accidents?`
-  );
-
-  const gitignoreResults = [];
-  if (addToIgnore) {
-    for (const { file } of scrubbedFiles) {
-      const added = addToGitignore(repoPath, file);
-      gitignoreResults.push({ file, added });
-    }
-    // Commit the .gitignore update so the working tree stays clean
-    try {
-      run('git add .gitignore', repoPath, { silent: true, failOk: true });
-      run('git commit -m "chore: add scrubbed files to .gitignore [git-vanish]"', repoPath, { silent: true, failOk: true });
-      console.log(chalk.green('\n  ✔  .gitignore updated and committed.\n'));
-    } catch {}
-  }
-
-  // ── 9. Success summary ─────────────────────────────────
-  successBox([
-    chalk.bold.green(`  ✔  ${scrubbedFiles.length} file(s) successfully scrubbed from all git history!`),
-    '',
-    ...scrubbedFiles.map(({ file, method }) =>
-      chalk.white(`  ${file}`) + chalk.cyan(`  [${method}]`)
-    ),
-    '',
-    chalk.white(`  .gitignore : `) + (addToIgnore
-      ? chalk.green(`${gitignoreResults.filter((r) => r.added).length} entry/entries added`)
-      : chalk.gray('skipped (you chose not to add)')),
-    chalk.white(`  Working copy: `) + chalk.green('preserved on disk (untracked)'),
-    '',
-    chalk.gray(`  Your file(s) are still on disk with their latest content.`),
-    chalk.gray(`  Git no longer knows they exist — they are now untracked.`),
-  ]);
-
-  printForcePushInstructions(repoPath, remoteUrl);
+  await runApp(ctx);
 }
 
 main().catch((err) => {
-  console.error(chalk.red('\n ✘  Unexpected error: ' + err.message + '\n'));
+  // The TUI restores the terminal from its own exit hook; this is the last
+  // line of defence for anything that escapes it.
+  process.stdout.write('\x1b[?25h\x1b[?1000l\x1b[?1006l');
+  console.error(chalk.red('\n ✘  ' + (err && err.message ? err.message : String(err)) + '\n'));
   process.exit(1);
 });
