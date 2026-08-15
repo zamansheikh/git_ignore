@@ -93,10 +93,19 @@ function coauthorsIn(message) {
  * name and a commit message are free text: "Foo | Bar" is a legal git name and
  * would split a pipe-delimited line in the wrong place.
  */
-function listAuthors(repoPath) {
+function listAuthors(repoPath, { includeRemotes = false } = {}) {
+  // Local branches and tags, not `--all`.
+  //
+  // `--all` includes refs/remotes/*, which is a cache of what the server had
+  // at the last fetch — not history we own or can rewrite. Counting it means
+  // that in the window between rewriting and force-pushing, every identity you
+  // just removed reappears in the listing, with every count doubled, and the
+  // post-rewrite verification declares its own successful rewrite a failure.
+  // The remote is fixed by pushing, not by filtering it again.
+  const scope = includeRemotes ? ['--all'] : ['--branches', '--tags', 'HEAD'];
   const out = spawnSync(
     'git',
-    ['log', '--all', '--pretty=format:%x01%an%x00%ae%x00%cn%x00%ce%x00%B'],
+    ['log', ...scope, '--pretty=format:%x01%an%x00%ae%x00%cn%x00%ce%x00%B'],
     { cwd: repoPath, stdio: 'pipe', maxBuffer: 256 * 1024 * 1024 },
   );
   if (out.status !== 0) {
@@ -444,6 +453,18 @@ async function reassignAuthors(repoPath, pairs, opts = {}, onProgress = console.
 }
 
 /**
+ * Identities that survive only in remote-tracking refs — i.e. that you have
+ * already rewritten locally but not yet force-pushed. Worth reporting, because
+ * otherwise the difference between "the rewrite failed" and "you have not
+ * pushed yet" is invisible.
+ */
+function staleOnRemote(repoPath) {
+  const local = new Set(listAuthors(repoPath).map((a) => a.email.toLowerCase()));
+  return listAuthors(repoPath, { includeRemotes: true })
+    .filter((a) => !local.has(a.email.toLowerCase()));
+}
+
+/**
  * Delete one or more identities' `Co-authored-by:` trailers from every commit
  * message. Convenience wrapper — the work is the same rewrite.
  *
@@ -466,5 +487,6 @@ module.exports = {
   previewReassign,
   captureRemotes,
   countFor,
+  staleOnRemote,
   hasFilterRepo,
 };

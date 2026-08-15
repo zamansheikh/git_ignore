@@ -574,7 +574,12 @@ async function contributorsFlow(ui, ctx) {
     return false;
   }
 
-  const width = Math.max(10, ...people.map((p) => `${p.name} <${p.email}>`.length));
+  // The numbers are the point of this screen, so the identity column yields to
+  // them: a long noreply address gets elided rather than pushing the counts off
+  // the right edge.
+  const NUMERIC = 10 + 12 + 14 + 8;
+  const longest = Math.max(10, ...people.map((p) => `${p.name} <${p.email}>`.length));
+  const width = Math.max(20, Math.min(longest, ui.width - NUMERIC - 5));
 
   await ui.page({
     title: `${people.length} identit${people.length === 1 ? 'y' : 'ies'} in history`,
@@ -583,17 +588,33 @@ async function contributorsFlow(ui, ctx) {
     lines: people.length === 0
       ? [theme.dim('No commits yet.')]
       : [
+          // The co-authored column belongs here as much as in --list-authors:
+          // without it, someone who only appears in trailers reads as "0, 0,
+          // total 1", which looks like a bug in the tool rather than the one
+          // fact on this screen the reader most needs.
           theme.dim(fit('  identity', width + 4) + fit('authored', 10, 'right')
-            + fit('committed', 12, 'right') + fit('total', 8, 'right')),
+            + fit('committed', 12, 'right') + fit('co-authored', 14, 'right')
+            + fit('total', 8, 'right')),
           '',
           ...people.map((p) =>
             '  ' + chalk.white(fit(`${p.name} <${p.email}>`, width))
             + theme.accent(String(p.authored).padStart(10))
             + theme.dim(String(p.committed).padStart(12))
+            + (p.coauthored
+              ? theme.warn(String(p.coauthored).padStart(14))
+              : theme.dim('0'.padStart(14)))
             + chalk.white(String(p.count).padStart(8))),
           '',
           theme.dim('  "committed" counts commits someone applied but did not write — rebases and'),
           theme.dim('  squashed merges leave these behind, and a reassignment must catch them too.'),
+          ...(people.some((p) => p.coauthored > 0)
+            ? [
+                '',
+                theme.dim('  "co-authored" comes from ') + theme.warn('Co-authored-by:')
+                  + theme.dim(' trailers in the commit message.'),
+                theme.dim('  GitHub counts these as contributors even when the person authored nothing.'),
+              ]
+            : []),
         ],
     buttonLabel: 'Back',
   });

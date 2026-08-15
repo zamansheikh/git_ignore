@@ -23,7 +23,7 @@ const { program } = require('commander');
 
 const { redactSecrets } = require('./git/redact');
 const {
-  reassignAuthors, listAuthors, parseMapping, captureRemotes,
+  reassignAuthors, listAuthors, parseMapping, captureRemotes, staleOnRemote,
 } = require('./git/reassign');
 const { runApp, vanishFlow, repoStats, dirtyFiles } = require('./ui/flows');
 
@@ -175,6 +175,19 @@ function runListAuthors(repoPath) {
         + chalk.cyan(`git-vanish --remove-coauthor "${email}"`));
     }
     console.log('');
+  }
+
+  // Identities you have already rewritten locally but not yet force-pushed
+  // still sit in refs/remotes/*. Saying so is the difference between "the
+  // rewrite failed" and "you have not pushed yet".
+  const stale = staleOnRemote(repoPath);
+  if (stale.length > 0) {
+    console.log(chalk.yellow(`\n  ${stale.length} identit${stale.length === 1 ? 'y is' : 'ies are'} gone locally but still on the remote:\n`));
+    for (const a of stale) {
+      console.log(chalk.gray(`    ${a.name} <${a.email}>`) + chalk.gray(`  (${a.count} refs)`));
+    }
+    console.log(chalk.gray('\n  These live in refs/remotes/* — a cache of what the server still has.'));
+    console.log(chalk.gray('  Force-push to replace it:  ') + chalk.cyan('git push --force --all\n'));
   }
 
   console.log(chalk.gray('  Reassign with:  ') + chalk.cyan('git-vanish --reassign "Old <old@mail>=New <new@mail>"\n'));
