@@ -31,6 +31,7 @@ const { scrubFile, addToGitignore } = require('../git/rewrite');
 const { redactSecrets, maskSecret, countOccurrences } = require('../git/redact');
 const {
   reassignAuthors, listAuthors, previewReassign, captureRemotes, hasFilterRepo,
+  identityRoles,
 } = require('../git/reassign');
 const { createBackupBundle, restoreHint } = require('../git/backup');
 const { confirm } = require('./confirm');
@@ -218,6 +219,24 @@ async function blockIfNoFilterRepo(ui, ctx, crumb, what) {
 
 const CRUMB_REASSIGN = 'Reassign contributor';
 
+/** Sentinel target: delete the identity rather than move it to someone. */
+const REMOVE = Symbol('remove');
+
+/**
+ * "9 authored · 5 committed · 7 co-authored" — where an identity actually
+ * appears. The breakdown matters because the three roles are fixed by
+ * different mechanisms, and a co-author trailer is the one people never
+ * expect to find.
+ */
+function roleSummary(r) {
+  const parts = [
+    r.authored ? `${r.authored} authored` : null,
+    r.committed ? `${r.committed} committed` : null,
+    r.coauthored ? `${r.coauthored} co-authored` : null,
+  ].filter(Boolean);
+  return parts.length ? parts.join(' · ') : 'not in history';
+}
+
 async function reassignFlow(ui, ctx) {
   if (await blockIfNoFilterRepo(ui, ctx, CRUMB_REASSIGN, 'Reassigning authorship')) return false;
   if (await blockIfDirty(ui, ctx, CRUMB_REASSIGN)) return false;
@@ -242,33 +261,48 @@ async function reassignFlow(ui, ctx) {
     return false;
   }
 
+  const anyCoauthors = people.some((p) => p.coauthored > 0);
+
   // ── 1. Who is moving? ──
   const sources = await ui.checklist({
     title: 'Whose commits are moving?',
     crumb: CRUMB_REASSIGN,
     right: ctx.repoName,
     items: people.map((p) => ({
-      label: `${p.name || theme.dim('(no name)')} <${p.email}>`,
-      hint: `${p.count} refs · ${p.authored} authored`,
+      label: `${p.name || '(no name)'} <${p.email}>`,
+      hint: roleSummary(p),
       value: p,
     })),
     note: theme.dim('  Matching is by email, so every display name this person used is included.\n')
-      + theme.dim('  Tick several to merge them all onto one identity.'),
+      + theme.dim('  Tick several to merge them all onto one identity.')
+      + (anyCoauthors
+        ? '\n' + theme.warn('  co-authored')
+          + theme.dim(' = a Co-authored-by: trailer in the message. GitHub counts these\n')
+          + theme.dim('  as contributors even when the person authored nothing.')
+        : ''),
   });
   if (!sources || sources.length === 0) return false;
 
   // Two source rows can share an email (same person, different display names);
-  // one mailmap rule covers both, so collapse them before building mappings.
+  // one rule covers both, so collapse them before building mappings.
   const uniqueEmails = [...new Map(sources.map((s) => [s.email.toLowerCase(), s])).values()];
 
+  // Someone who only ever appears in a trailer can simply be deleted. Someone
+  // who authored or committed cannot — every commit needs an author — so the
+  // "remove" option is offered only when it is actually possible.
+  const roles = uniqueEmails.map((s) => identityRoles(ctx.repoPath, s.email));
+  const removable = roles.every((r) => r.coauthored > 0 && r.authored === 0 && r.committed === 0);
+
   // ── 2. Where do they go? ──
-  const target = await pickTarget(ui, ctx, people, uniqueEmails);
+  const target = await pickTarget(ui, ctx, people, uniqueEmails, removable);
   if (!target) return false;
 
   // ── 3. Review ──
+  const removing = target === REMOVE;
   const pairs = uniqueEmails.map((s) => ({
     from: `${s.name} <${s.email}>`,
-    to: `${target.name} <${target.email}>`,
+    to: removing ? null : `${target.name} <${target.email}>`,
+    remove: removing,
   }));
 
   let preview;
@@ -292,44 +326,84 @@ async function reassignFlow(ui, ctx) {
     return false;
   }
 
-  const renameOnly = preview.every((m) => m.from.email.toLowerCase() === m.to.email.toLowerCase());
+  const renameOnly = !removing
+    && preview.every((m) => m.from.email.toLowerCase() === m.to.email.toLowerCase());
+  const touchesTrailers = preview.some((m) => m.roles.coauthored > 0);
+  const touchesFields = preview.some((m) => m.roles.authored + m.roles.committed > 0);
 
   // The one screen that must never abbreviate: an elided character in the
   // email you are about to erase is exactly the typo you would not catch.
   // Side by side when both identities fit, stacked when they do not.
   const label = (id) => `${id.name || '(no name)'} <${id.email}>`;
-  const widest = Math.max(...preview.flatMap((m) => [label(m.from).length, label(m.to).length]));
-  const sideBySide = widest * 2 + 16 <= ui.width;
 
-  const mappingLines = preview.flatMap((m) =>
-    sideBySide
-      ? ['  ' + theme.danger(fit(label(m.from), widest))
+  // Several ticked rows can share one email — the same person under different
+  // display names. They collapse into a single rule, so the review has to name
+  // every display name that rule will catch rather than whichever row happened
+  // to survive the collapse.
+  const namesFor = (email) => sources
+    .filter((s) => s.email.toLowerCase() === email.toLowerCase())
+    .map((s) => s.name || '(no name)');
+  const fromLabel = (m) => {
+    const names = namesFor(m.from.email);
+    return names.length > 1 ? `<${m.from.email}>` : label(m.from);
+  };
+
+  const widest = Math.max(...preview.flatMap((m) =>
+    [fromLabel(m).length, removing ? 9 : label(m.to).length]));
+  const sideBySide = widest * 2 + 16 <= ui.width;
+  const rhs = (m) => (removing ? theme.dim('(removed)') : theme.ok(label(m.to)));
+
+  const mappingLines = preview.flatMap((m) => {
+    const names = namesFor(m.from.email);
+    const covering = names.length > 1
+      ? ['    ' + theme.dim(`covering ${names.length} display names: ${names.join(', ')}`)]
+      : [];
+
+    return sideBySide
+      ? ['  ' + theme.danger(fit(fromLabel(m), widest))
          + theme.accent(' → ')
-         + theme.ok(fit(label(m.to), widest))
-         + theme.dim(`  ${m.refs} refs`)]
+         + (removing ? theme.dim(fit('(removed)', widest)) : theme.ok(fit(label(m.to), widest)))
+         + theme.dim(`  ${roleSummary(m.roles)}`),
+         ...covering]
       : [
-          '  ' + theme.danger(label(m.from)) + theme.dim(`   ${m.refs} refs`),
-          '    ' + theme.accent('→ ') + theme.ok(label(m.to)),
+          '  ' + theme.danger(fromLabel(m)) + theme.dim(`   ${roleSummary(m.roles)}`),
+          ...covering,
+          '    ' + theme.accent('→ ') + rhs(m),
           '',
-        ]);
+        ];
+  });
+
+  const changes = [
+    touchesFields ? 'author, committer and tagger fields' : null,
+    touchesTrailers ? 'Co-authored-by: trailers in commit messages' : null,
+  ].filter(Boolean).join(' + ');
 
   const ok = await ui.page({
-    title: 'Review the reassignment',
+    title: removing ? 'Review the removal' : 'Review the reassignment',
     crumb: CRUMB_REASSIGN,
     right: ctx.repoName,
     lines: [
-      theme.label('These identities will be rewritten across all branches and tags:'),
+      theme.label(removing
+        ? 'These identities will be dropped from every commit message:'
+        : 'These identities will be rewritten across all branches and tags:'),
       '',
       ...mappingLines,
       '',
-      theme.label('What changes:  ') + 'author, committer and tagger fields',
-      theme.label('What does not: ') + 'files, messages, dates, commit order',
+      theme.label('What changes:  ') + changes,
+      theme.label('What does not: ') + (touchesTrailers
+        ? 'files, dates, commit order, the rest of every message'
+        : 'files, messages, dates, commit order'),
       '',
-      renameOnly
-        ? theme.dim('The email is unchanged — this is a display-name correction.')
-        : theme.dim('The old email disappears from this copy of the history entirely.'),
+      removing
+        ? theme.dim('The trailer line is deleted outright — nothing else in the message moves,')
+        : renameOnly
+          ? theme.dim('The email is unchanged — this is a display-name correction.')
+          : theme.dim('The old email disappears from this copy of the history entirely.'),
+      ...(removing
+        ? [theme.dim('and GitHub stops counting this identity as a contributor.')]
+        : []),
       '',
-      theme.dim(`${totalRefs} commit reference(s) across ${ctx.stats.commits} commits will be touched.`),
+      theme.dim(`${totalRefs} reference(s) across ${ctx.stats.commits} commits will be touched.`),
     ],
     buttonLabel: 'Continue',
   });
@@ -337,20 +411,29 @@ async function reassignFlow(ui, ctx) {
 
   // ── 4. Confirm and run ──
   const { go, backup } = await confirmDestructive(ui, {
-    title: 'Rewrite authorship?',
+    title: removing ? 'Remove these co-authors?' : 'Rewrite authorship?',
     crumb: CRUMB_REASSIGN,
     repoPath: ctx.repoPath,
-    confirmLabel: 'Reassign',
+    confirmLabel: removing ? 'Remove' : 'Reassign',
     lines: [
-      chalk.bold.white(`Reassign ${totalRefs} commit reference(s) in ${ctx.repoName}`),
+      chalk.bold.white(
+        removing
+          ? `Drop ${totalRefs} co-author trailer(s) from ${ctx.repoName}`
+          : `Reassign ${totalRefs} reference(s) in ${ctx.repoName}`
+      ),
       '',
-      ...preview.map((m) => '  ' + theme.danger(m.from.email) + ' → ' + theme.ok(`${m.to.name} <${m.to.email}>`)),
+      ...preview.map((m) => '  ' + theme.danger(m.from.email) + ' → '
+        + (removing ? theme.dim('removed') : theme.ok(`${m.to.name} <${m.to.email}>`))),
     ],
   });
   if (!go) return false;
 
   await ui.suspend(async () => {
-    console.log(chalk.bold(`\n Reassigning ${preview.length} identit${preview.length === 1 ? 'y' : 'ies'}:\n`));
+    console.log(chalk.bold(
+      removing
+        ? `\n Removing ${preview.length} co-author identit${preview.length === 1 ? 'y' : 'ies'}:\n`
+        : `\n Reassigning ${preview.length} identit${preview.length === 1 ? 'y' : 'ies'}:\n`
+    ));
     if (backup) console.log(chalk.gray(`   Backup: ${backup}\n`));
 
     let result;
@@ -365,19 +448,39 @@ async function reassignFlow(ui, ctx) {
 
     if (!result.changed) return;
 
-    console.log(chalk.green(`\n  ${G.check}  ${result.commits} commits kept, authorship moved.\n`));
-    console.log(chalk.gray('  Files, messages and dates are untouched — only the identity changed.'));
+    console.log(chalk.green(
+      removing
+        ? `\n  ${G.check}  ${result.commits} commits kept, co-author trailers removed.\n`
+        : `\n  ${G.check}  ${result.commits} commits kept, authorship moved.\n`
+    ));
+    console.log(chalk.gray(
+      touchesTrailers
+        ? '  Files, dates and commit order are untouched. Only identity fields and the\n' +
+          '  Co-authored-by: trailers changed.'
+        : '  Files, messages and dates are untouched — only the identity changed.'
+    ));
     printPublishSteps(result.remotes);
     await offerRemoteRestore(ctx.repoPath, result.remotes);
-    console.log(chalk.gray('  Existing clones and forks keep the old identity until they re-clone.\n'));
+    console.log(chalk.gray(
+      '  Existing clones and forks keep the old identity until they re-clone.\n'
+    ));
+    if (touchesTrailers) {
+      console.log(chalk.gray(
+        '  GitHub recalculates its contributor list from the pushed commits, so the\n' +
+        '  sidebar updates once the force-push lands.\n'
+      ));
+    }
     if (backup) console.log(chalk.gray(`  Undo everything with:  ${restoreHint(backup)}\n`));
   });
 
   return true;
 }
 
-/** Choose the identity the commits move TO. */
-async function pickTarget(ui, ctx, people, sources) {
+/**
+ * Choose the identity the commits move TO — or the sentinel meaning
+ * "delete them", which is a different operation with the same starting point.
+ */
+async function pickTarget(ui, ctx, people, sources, removable) {
   const sourceEmails = new Set(sources.map((s) => s.email.toLowerCase()));
   const others = people.filter((p) => !sourceEmails.has(p.email.toLowerCase()));
   const first = sources[0];
@@ -387,6 +490,12 @@ async function pickTarget(ui, ctx, people, sources) {
     crumb: CRUMB_REASSIGN,
     right: ctx.repoName,
     items: [
+      // Listed first when it applies: someone who only appears in a trailer is
+      // almost always someone you want gone, not someone you want renamed.
+      ...(removable ? [{
+        icon: '🧹', label: 'Nobody — remove them from the commits',
+        hint: 'deletes the Co-authored-by: line', value: REMOVE,
+      }] : []),
       { icon: '✍', label: 'Type a new identity', hint: 'name + email', value: 'new' },
       {
         icon: '👥', label: 'An existing contributor', hint: `${others.length} available`,
@@ -397,10 +506,14 @@ async function pickTarget(ui, ctx, people, sources) {
       },
       { icon: '↩', label: 'Back', value: null },
     ],
-    note: theme.dim('  Moving to an existing contributor merges the two identities into one.'),
+    note: removable
+      ? theme.dim('  These identities appear only in Co-authored-by: trailers, so they can be\n')
+        + theme.dim('  deleted outright — a trailer is optional, an author field is not.')
+      : theme.dim('  Moving to an existing contributor merges the two identities into one.'),
   });
 
   if (!how) return null;
+  if (how === REMOVE) return REMOVE;
 
   if (how === 'existing') {
     return ui.menu({

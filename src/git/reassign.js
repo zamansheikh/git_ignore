@@ -52,20 +52,53 @@ function hasFilterRepo() {
 }
 
 /**
- * Every identity in history, with how often it appears.
+ * `Co-authored-by:` trailers, anywhere in a commit message.
  *
- * Reads authors AND committers: a rebase or a squashed merge leaves someone as
- * committer on commits they did not author, and a reassignment that misses
- * those leaves the identity behind in half the history.
+ * This is the third place an identity hides, and the one everybody misses.
+ * GitHub builds its contributor list from these trailers as well as from the
+ * author and committer fields, so a person can own a repository's contributor
+ * sidebar while appearing on no commit's author line at all — which is exactly
+ * what happens to every repo where an AI assistant, a pairing partner or a
+ * patch-forwarder gets credited this way.
  *
- * Fields are separated with NUL rather than a printable character because a
- * display name is free text — "Foo | Bar" is a legal git name and would split
- * a pipe-delimited line in the wrong place.
+ * Matched case-insensitively and per line: git's own trailer parsing accepts
+ * any capitalisation, and different tools emit different ones.
+ */
+const COAUTHOR_RE = /^[ \t]*co-authored-by:[ \t]*(.+?)[ \t]*$/gim;
+
+/** Every `Co-authored-by:` identity in one commit message. */
+function coauthorsIn(message) {
+  const found = [];
+  COAUTHOR_RE.lastIndex = 0;
+  let m;
+  while ((m = COAUTHOR_RE.exec(message)) !== null) {
+    const id = parseIdentity(m[1]);
+    if (id && id.email) found.push(id);
+  }
+  return found;
+}
+
+/**
+ * Every identity in history, with how often it appears and in what role.
+ *
+ * Reads authors, committers AND co-author trailers. Each matters for a
+ * different reason:
+ *
+ *  • author    — who wrote it
+ *  • committer — a rebase or squashed merge leaves someone as committer on
+ *                commits they did not author, and a reassignment that misses
+ *                those leaves the identity behind in half the history
+ *  • co-author — a trailer in the message body, invisible to `git log --format`
+ *                and untouched by mailmap, but counted by GitHub
+ *
+ * Records are separated with \x01 and fields with NUL, because both a display
+ * name and a commit message are free text: "Foo | Bar" is a legal git name and
+ * would split a pipe-delimited line in the wrong place.
  */
 function listAuthors(repoPath) {
   const out = spawnSync(
     'git',
-    ['log', '--all', '--pretty=a%x00%an%x00%ae%n c%x00%cn%x00%ce'],
+    ['log', '--all', '--pretty=format:%x01%an%x00%ae%x00%cn%x00%ce%x00%B'],
     { cwd: repoPath, stdio: 'pipe', maxBuffer: 256 * 1024 * 1024 },
   );
   if (out.status !== 0) {
@@ -73,20 +106,29 @@ function listAuthors(repoPath) {
   }
 
   const people = new Map();
-  for (const raw of out.stdout.toString().split('\n')) {
-    const line = raw.trimStart();
-    if (!line) continue;
-    const parts = line.split('\x00');
-    if (parts.length !== 3) continue;
-
-    const [role, name, email] = [parts[0], parts[1], parts[2].trim()];
-    if (!email) continue;
-
-    const key = `${name}\x00${email}`;
-    const entry = people.get(key) || { name, email, authored: 0, committed: 0, count: 0 };
-    if (role === 'a') entry.authored += 1; else entry.committed += 1;
+  const add = (name, email, role) => {
+    const clean = String(email || '').trim();
+    if (!clean) return;
+    const key = `${name}\x00${clean}`;
+    const entry = people.get(key)
+      || { name, email: clean, authored: 0, committed: 0, coauthored: 0, count: 0 };
+    entry[role] += 1;
     entry.count += 1;
     people.set(key, entry);
+  };
+
+  for (const record of out.stdout.toString().split('\x01')) {
+    if (!record) continue;
+    const parts = record.split('\x00');
+    if (parts.length < 5) continue;
+
+    const [an, ae, cn, ce] = parts;
+    // A message could in principle contain a NUL; put it back together.
+    const body = parts.slice(4).join('\x00');
+
+    add(an, ae, 'authored');
+    add(cn, ce, 'committed');
+    for (const co of coauthorsIn(body)) add(co.name, co.email, 'coauthored');
   }
 
   return [...people.values()].sort(
@@ -94,7 +136,25 @@ function listAuthors(repoPath) {
   );
 }
 
-/** How many commit references still carry this email, as author or committer. */
+/**
+ * Where one email appears, summed across every display name it used.
+ * The UI needs this to know whether an identity can simply be dropped: a
+ * trailer can be deleted, an author field cannot — a commit must have an author.
+ */
+function identityRoles(repoPath, email) {
+  const lower = String(email).toLowerCase();
+  const roles = { authored: 0, committed: 0, coauthored: 0, total: 0 };
+  for (const a of listAuthors(repoPath)) {
+    if (a.email.toLowerCase() !== lower) continue;
+    roles.authored += a.authored;
+    roles.committed += a.committed;
+    roles.coauthored += a.coauthored;
+    roles.total += a.count;
+  }
+  return roles;
+}
+
+/** How many references still carry this email, in any of the three roles. */
 function countFor(repoPath, email) {
   const lower = String(email).toLowerCase();
   return listAuthors(repoPath)
@@ -142,25 +202,48 @@ function parseMapping(raw) {
   return { from, to };
 }
 
-/** Turn raw mapping strings into validated {from, to} identity pairs. */
+/**
+ * Turn raw mapping strings into validated operations.
+ *
+ * A pair whose `to` is null or empty means "delete this person's co-author
+ * trailers" rather than "move them somewhere". That is a genuinely different
+ * operation and only legal for someone who appears in trailers alone — every
+ * commit needs an author, so an author field can be reassigned but never
+ * deleted.
+ */
 function buildMappings(pairs) {
   return pairs.map((pair) => {
     const from = parseIdentity(pair.from);
-    const to = parseIdentity(pair.to);
     if (!from) throw new Error(`Could not parse identity "${pair.from}" — expected: Name <email>`);
+
+    if (pair.remove || pair.to === null || pair.to === '') {
+      return { from, to: null, remove: true };
+    }
+
+    const to = parseIdentity(pair.to);
     if (!to) throw new Error(`Could not parse identity "${pair.to}" — expected: Name <email>`);
     if (!to.name) throw new Error(`The new identity needs a display name: "${pair.to}"`);
     if (from.email.toLowerCase() === to.email.toLowerCase() && from.name === to.name) {
       throw new Error(`"${pair.from}" and "${pair.to}" are the same identity — nothing to change.`);
     }
-    return { from, to };
+    // These strings become lines in git-filter-repo's replacement file, whose
+    // format uses `==>` as the separator and one rule per line.
+    for (const part of [to.name, to.email, from.email]) {
+      if (part.includes('==>') || /[\r\n]/.test(part)) {
+        throw new Error(`Identity contains characters that cannot be rewritten safely: "${part}"`);
+      }
+    }
+    return { from, to, remove: false };
   });
 }
 
 /** What a reassignment would touch, without touching anything. */
 function previewReassign(repoPath, pairs) {
-  const mappings = buildMappings(pairs);
-  return mappings.map((m) => ({ ...m, refs: countFor(repoPath, m.from.email) }));
+  return buildMappings(pairs).map((m) => ({
+    ...m,
+    refs: countFor(repoPath, m.from.email),
+    roles: identityRoles(repoPath, m.from.email),
+  }));
 }
 
 /** Remotes recorded before the rewrite — filter-repo drops them. */
@@ -175,9 +258,52 @@ function captureRemotes(repoPath) {
   return [...seen.entries()].map(([name, url]) => ({ name, url }));
 }
 
+/** Escape a string for use inside a Python regular expression. */
+function reEscape(s) {
+  return String(s).replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}
+
+/**
+ * Rules for git-filter-repo's `--replace-message`, one per line, in its
+ * `pattern==>replacement` format.
+ *
+ * mailmap cannot reach a co-author trailer — it rewrites the author, committer
+ * and tagger headers, and a trailer is ordinary text in the message body. So
+ * trailers are handled here instead, matched on email so every display name the
+ * person was credited under is caught by one rule.
+ */
+function messageRules(mappings) {
+  const rules = [];
+  let removed = false;
+
+  for (const m of mappings) {
+    const email = reEscape(m.from.email);
+
+    if (m.remove) {
+      // Swallow the newline BEFORE the trailer so the line disappears whole
+      // rather than leaving an empty one behind.
+      rules.push(`regex:(?i)\\n[ \\t]*co-authored-by:[ \\t]*[^\\n]*<${email}>[^\\n]*==>`);
+      removed = true;
+    } else {
+      // Backslashes are meaningful in a re.sub replacement template.
+      const to = `Co-authored-by: ${m.to.name} <${m.to.email}>`.replace(/\\/g, '\\\\');
+      rules.push(`regex:(?im)^[ \\t]*co-authored-by:[ \\t]*[^\\n]*<${email}>[^\\n]*$==>${to}`);
+    }
+  }
+
+  // Deleting the last trailer leaves the message ending in a blank line. Tidy
+  // that up — but only when something was actually deleted, so a pure
+  // reassignment leaves every other message byte-for-byte identical.
+  if (removed) rules.push('regex:\\n\\s*\\n\\s*$==>\\n');
+
+  return rules;
+}
+
 /**
  * @param {string} repoPath
- * @param {Array<{from: string, to: string}>} pairs  each side as `Name <email>`
+ * @param {Array<{from: string, to: string|null, remove?: boolean}>} pairs
+ *        each side as `Name <email>`; a null/empty `to` deletes the person's
+ *        co-author trailers instead of moving them
  * @param {{dryRun?: boolean}} opts
  */
 async function reassignAuthors(repoPath, pairs, opts = {}, onProgress = console.log) {
@@ -194,13 +320,36 @@ async function reassignAuthors(repoPath, pairs, opts = {}, onProgress = console.
   // Report scope before doing anything irreversible.
   const found = [];
   for (const m of mappings) {
-    const n = countFor(repoPath, m.from.email);
-    onProgress(
-      n > 0
-        ? chalk.yellow(`  ${m.from.email} → ${m.to.name} <${m.to.email}>  (${n} commit refs)`)
-        : chalk.gray(`  ${m.from.email} → not present in history, skipping`),
-    );
-    if (n > 0) found.push(m);
+    const roles = identityRoles(repoPath, m.from.email);
+    const n = roles.total;
+
+    if (n === 0) {
+      onProgress(chalk.gray(`  ${m.from.email} → not present in history, skipping`));
+      continue;
+    }
+
+    // A commit must have an author, so an author or committer field can be
+    // moved to someone else but never simply deleted.
+    if (m.remove && (roles.authored > 0 || roles.committed > 0)) {
+      throw new Error(
+        `"${m.from.email}" is the author or committer of ${roles.authored + roles.committed} ` +
+          'commit ref(s), not just a co-author trailer. Every commit needs an author, so this ' +
+          'identity has to be reassigned to someone rather than removed.',
+      );
+    }
+
+    const where = [
+      roles.authored ? `${roles.authored} authored` : null,
+      roles.committed ? `${roles.committed} committed` : null,
+      roles.coauthored ? `${roles.coauthored} co-authored` : null,
+    ].filter(Boolean).join(', ');
+
+    onProgress(chalk.yellow(
+      m.remove
+        ? `  ${m.from.email} → removing co-author trailer  (${where})`
+        : `  ${m.from.email} → ${m.to.name} <${m.to.email}>  (${where})`,
+    ));
+    found.push({ ...m, roles });
   }
 
   if (found.length === 0) {
@@ -217,22 +366,41 @@ async function reassignAuthors(repoPath, pairs, opts = {}, onProgress = console.
   const before = run('git rev-list --all --count', repoPath, { silent: true }).trim();
 
   // mailmap format: `New Name <new@email> <old@email>` — match on old email,
-  // which catches every display name the person ever committed under.
-  const mailmapPath = path.join(os.tmpdir(), `git-vanish-mailmap-${Date.now()}.txt`);
-  fs.writeFileSync(
-    mailmapPath,
-    found.map((m) => `${m.to.name} <${m.to.email}> <${m.from.email}>`).join('\n') + '\n',
-    'utf8',
-  );
+  // which catches every display name the person ever committed under. Only the
+  // reassignments go here; a removal has no target to map to.
+  const moves = found.filter((m) => !m.remove);
+  const rules = messageRules(found.filter((m) => m.remove || m.roles.coauthored > 0));
+
+  const stamp = Date.now();
+  const mailmapPath = path.join(os.tmpdir(), `git-vanish-mailmap-${stamp}.txt`);
+  const messagePath = path.join(os.tmpdir(), `git-vanish-messages-${stamp}.txt`);
+  const args = ['git filter-repo --force'];
+
+  if (moves.length > 0) {
+    fs.writeFileSync(
+      mailmapPath,
+      moves.map((m) => `${m.to.name} <${m.to.email}> <${m.from.email}>`).join('\n') + '\n',
+      'utf8',
+    );
+    args.push(`--mailmap "${mailmapPath}"`);
+  }
+  if (rules.length > 0) {
+    fs.writeFileSync(messagePath, rules.join('\n') + '\n', 'utf8');
+    args.push(`--replace-message "${messagePath}"`);
+  }
 
   try {
-    onProgress('Rewriting history with git filter-repo --mailmap…');
+    onProgress(rules.length > 0
+      ? 'Rewriting history with git filter-repo (identities and message trailers)…'
+      : 'Rewriting history with git filter-repo --mailmap…');
     // Captured rather than inherited: filter-repo interleaves progress counters
     // with its own notices, and the useful part is the summary we print below.
-    run(`git filter-repo --force --mailmap "${mailmapPath}"`, repoPath, { silent: true });
+    run(args.join(' '), repoPath, { silent: true });
     onProgress('Rewrite complete.');
   } finally {
-    try { fs.unlinkSync(mailmapPath); } catch {}
+    for (const p of [mailmapPath, messagePath]) {
+      try { fs.unlinkSync(p); } catch {}
+    }
   }
 
   onProgress('Expiring reflogs and collecting garbage…');
@@ -249,15 +417,15 @@ async function reassignAuthors(repoPath, pairs, opts = {}, onProgress = console.
     );
   }
 
-  // Verify per mapping. When the new identity keeps the old email — renaming
-  // someone rather than replacing them — the email surviving is the expected
-  // outcome, so what has to be checked is that no entry still carries the old
-  // display name.
+  // Verify per mapping, against all three roles. When the new identity keeps
+  // the old email — renaming someone rather than replacing them — the email
+  // surviving is the expected outcome, so what has to be checked is that no
+  // entry still carries the old display name.
   const identities = listAuthors(repoPath);
   const leftovers = [];
   for (const m of found) {
     const oldEmail = m.from.email.toLowerCase();
-    const keepsEmail = m.to.email.toLowerCase() === oldEmail;
+    const keepsEmail = !m.remove && m.to.email.toLowerCase() === oldEmail;
     const stale = identities.filter(
       (a) => a.email.toLowerCase() === oldEmail && (!keepsEmail || a.name !== m.to.name),
     );
@@ -277,9 +445,23 @@ async function reassignAuthors(repoPath, pairs, opts = {}, onProgress = console.
   };
 }
 
+/**
+ * Delete one or more identities' `Co-authored-by:` trailers from every commit
+ * message. Convenience wrapper — the work is the same rewrite.
+ *
+ * @param {string[]} identities  each as `Name <email>` or a bare email
+ */
+async function removeCoauthors(repoPath, identities, opts = {}, onProgress = console.log) {
+  const pairs = identities.map((from) => ({ from, to: null, remove: true }));
+  return reassignAuthors(repoPath, pairs, opts, onProgress);
+}
+
 module.exports = {
   reassignAuthors,
+  removeCoauthors,
   listAuthors,
+  identityRoles,
+  coauthorsIn,
   parseIdentity,
   parseMapping,
   buildMappings,

@@ -68,6 +68,14 @@ program
     'Reassign commits: "Old Name <old@mail>=New Name <new@mail>" (repeatable)',
     (val, prev) => (prev || []).concat([val])
   )
+  // Co-author trailers are the third place an identity hides, and the only one
+  // that can simply be deleted — a commit needs an author, but it does not need
+  // a `Co-authored-by:` line.
+  .option(
+    '--remove-coauthor <identity>',
+    'Delete this identity\'s Co-authored-by: trailers from every commit (repeatable)',
+    (val, prev) => (prev || []).concat([val])
+  )
   .parse(process.argv);
 
 const opts = program.opts();
@@ -135,37 +143,68 @@ function runListAuthors(repoPath) {
 
   const width = Math.max(...people.map((p) => `${p.name} <${p.email}>`.length));
   console.log(chalk.gray(
-    '   ' + 'identity'.padEnd(width) + 'authored'.padStart(10) + 'committed'.padStart(12) + 'total'.padStart(8)
+    '   ' + 'identity'.padEnd(width)
+    + 'authored'.padStart(10) + 'committed'.padStart(12) + 'co-authored'.padStart(14) + 'total'.padStart(8)
   ));
   for (const p of people) {
     console.log(
       '   ' + `${p.name} <${p.email}>`.padEnd(width)
       + chalk.cyan(String(p.authored).padStart(10))
       + chalk.gray(String(p.committed).padStart(12))
+      + (p.coauthored ? chalk.magenta(String(p.coauthored).padStart(14)) : chalk.gray('0'.padStart(14)))
       + chalk.white(String(p.count).padStart(8))
     );
   }
+
   console.log(chalk.gray(
     '\n  "committed" counts commits someone applied but did not write — rebases and squashed\n' +
-    '  merges leave these behind, and a reassignment has to catch them too.\n'
+    '  merges leave these behind, and a reassignment has to catch them too.'
   ));
+
+  const trailerOnly = people.filter((p) => p.coauthored > 0 && p.authored === 0 && p.committed === 0);
+  if (trailerOnly.length > 0) {
+    console.log(chalk.gray(
+      '\n  "co-authored" comes from ') + chalk.magenta('Co-authored-by:') + chalk.gray(' trailers in commit messages.\n' +
+      '  GitHub counts these toward its contributor list, so an identity can own a slot in\n' +
+      '  your sidebar without appearing on a single commit\'s author line.\n'
+    ));
+    // One rule per email, not per display name: matching is by email, so the
+    // same command covers every name the person was credited under.
+    for (const email of new Set(trailerOnly.map((p) => p.email.toLowerCase()))) {
+      console.log(chalk.gray('  Remove with:    ')
+        + chalk.cyan(`git-vanish --remove-coauthor "${email}"`));
+    }
+    console.log('');
+  }
+
   console.log(chalk.gray('  Reassign with:  ') + chalk.cyan('git-vanish --reassign "Old <old@mail>=New <new@mail>"\n'));
 }
 
-/* ─── non-interactive: reassign ──────────────────────────── */
+/* ─── non-interactive: reassign / remove co-author ───────── */
 
 async function runReassign(repoPath) {
-  const pairs = opts.reassign.map((raw) => {
+  const pairs = [];
+
+  for (const raw of opts.reassign || []) {
     const parsed = parseMapping(raw);
     if (!parsed) {
       die(`Bad mapping: ${raw}`, 'Expected:  "Old Name <old@mail>=New Name <new@mail>"');
     }
-    return parsed;
-  });
+    pairs.push(parsed);
+  }
+  for (const raw of opts.removeCoauthor || []) {
+    pairs.push({ from: raw, to: null, remove: true });
+  }
 
   requireCleanTree(repoPath);
 
-  console.log(chalk.bold(`\n Reassigning authorship on ${pairs.length} identit${pairs.length === 1 ? 'y' : 'ies'}:\n`));
+  const removals = pairs.filter((p) => p.remove).length;
+  const moves = pairs.length - removals;
+  const what = [
+    moves ? `reassigning ${moves}` : null,
+    removals ? `removing ${removals} co-author` : null,
+  ].filter(Boolean).join(', ');
+  console.log(chalk.bold(`\n Rewriting identities (${what}):\n`));
 
   const result = await reassignAuthors(
     repoPath, pairs, { dryRun: opts.dryRun },
@@ -174,8 +213,13 @@ async function runReassign(repoPath) {
 
   if (!result.changed) return;
 
-  console.log(chalk.green(`\n  ✓  ${result.commits} commits kept, authorship moved.\n`));
-  console.log(chalk.gray('  Files, messages and dates are untouched — only the identity changed.'));
+  console.log(chalk.green(`\n  ✓  ${result.commits} commits kept, identities rewritten.\n`));
+  console.log(chalk.gray(
+    removals
+      ? '  Files, dates and commit order are untouched. Only the identity fields and the\n' +
+        '  Co-authored-by: trailers changed.'
+      : '  Files, messages and dates are untouched — only the identity changed.'
+  ));
   printPublishSteps(result.remotes);
   console.log(chalk.gray('  Existing clones and forks keep the old identity until they re-clone.\n'));
 }
@@ -217,7 +261,11 @@ async function main() {
   // ── Non-interactive paths, in the order they short-circuit ──
 
   if (opts.listAuthors) { banner(repoPath); return runListAuthors(repoPath); }
-  if (opts.reassign && opts.reassign.length > 0) { banner(repoPath); return runReassign(repoPath); }
+  if ((opts.reassign && opts.reassign.length > 0) ||
+      (opts.removeCoauthor && opts.removeCoauthor.length > 0)) {
+    banner(repoPath);
+    return runReassign(repoPath);
+  }
 
   const secrets = [
     ...(opts.secret || []),

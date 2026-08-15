@@ -154,6 +154,47 @@ identities that should be one.
 Every commit, file, message and date is preserved. Only the author and
 committer change, so `git log --stat` reads exactly the same afterwards.
 
+### An identity hides in three places
+
+GitHub builds its contributor sidebar from all three, and git-vanish reads all
+three:
+
+| Role | Where it lives | Can it be removed? |
+| --- | --- | --- |
+| **author** | commit header | No — reassign it; every commit needs an author |
+| **committer** | commit header | No — reassign it |
+| **co-author** | `Co-authored-by:` trailer in the message body | **Yes** — the line is optional |
+
+The third one is the one that surprises people. A `Co-authored-by:` trailer is
+ordinary text in the commit message, so it is invisible to `git log --format`,
+untouched by `.mailmap`, and **counted by GitHub anyway**. That is how an
+identity ends up owning a slot in your contributor list without appearing on a
+single commit's author line — the usual culprits being AI assistants, pairing
+partners and patch forwarders.
+
+`--list-authors` breaks the three apart so you can see which you are dealing
+with:
+
+```
+   identity                                 authored   committed   co-authored   total
+   zamansheikh <zaman6545@gmail.com>              31          31             0      62
+   Claude Fable 5 <noreply@anthropic.com>          0           0             7       7
+   Claude Opus 4.8 <noreply@anthropic.com>         0           0             1       1
+```
+
+Two display names, one email, no commits authored: everything above the human
+comes from message trailers. Remove it with one command — matching is by email,
+so both display names go together:
+
+```bash
+git-vanish --remove-coauthor "noreply@anthropic.com"
+```
+
+Or pick **"Nobody — remove them from the commits"** in the interactive wizard,
+which offers that option whenever the selected identity appears in trailers
+alone. The trailer line is deleted whole, the rest of every message is left
+byte-for-byte identical, and the commit count is verified unchanged.
+
 ### Interactively
 
 ```bash
@@ -202,22 +243,33 @@ git-vanish \
 
 # Fix a display name without changing the email
 git-vanish --reassign "bob <bob@corp.com>=Bob Smith <bob@corp.com>"
+
+# Delete someone's Co-authored-by: trailers entirely
+git-vanish --remove-coauthor "noreply@anthropic.com"
+
+# Or point those trailers at a real person instead of deleting them
+git-vanish --reassign "noreply@anthropic.com=Jane Doe <jane@example.com>"
 ```
 
 | Flag | Description |
 | --- | --- |
-| `--list-authors` | Everyone in history with authored/committed/total counts, then exit |
+| `--list-authors` | Everyone in history with authored/committed/co-authored/total counts, then exit |
 | `--reassign <mapping>` | `"Old <old@mail>=New <new@mail>"` (repeatable) |
+| `--remove-coauthor <identity>` | Delete this identity's `Co-authored-by:` trailers (repeatable) |
 
 Notes:
 
 - Matching is by **email**, so someone who committed under several display
   names is caught by one rule. The left-hand name is for your benefit only.
-- Both the **author** and the **committer** are rewritten, and the **tagger** on
-  annotated tags. Missing the committer is the usual mistake: a rebase or
-  squashed merge leaves a person as committer on work they did not author, and
-  half the history keeps their name. `--list-authors` shows both columns so you
-  can see when that has happened.
+- The **author**, the **committer**, the **tagger** on annotated tags, and
+  `Co-authored-by:` **trailers** are all rewritten. Missing the committer is the
+  usual mistake: a rebase or squashed merge leaves a person as committer on work
+  they did not author, and half the history keeps their name. Missing the
+  trailer is the other one, and it is the one that keeps them in GitHub's
+  sidebar. `--list-authors` shows all three columns so you can see which applies.
+- `--remove-coauthor` refuses to run against someone who actually authored or
+  committed something, and tells you to reassign them instead — a commit cannot
+  be left without an author.
 - Afterwards git-vanish **verifies** that the old identity is gone and that the
   commit count is unchanged, and fails loudly rather than leaving you with
   something bad to force-push.

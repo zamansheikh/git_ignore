@@ -37,6 +37,17 @@ function reflow(cursor, total, height, offset) {
 }
 
 /**
+ * Append a footnote under a list, indenting every line of it. Notes are written
+ * as prose with embedded newlines; indenting only the first line — which is
+ * what happens if you hand the whole string over as one row — leaves the
+ * continuation hanging off the left margin.
+ */
+function pushNote(body, note) {
+  body.push('');
+  for (const line of String(note).split('\n')) body.push(' ' + line);
+}
+
+/**
  * A two-column row — label on the left, dim detail flush right — laid out in
  * plain text so a caller can paint the whole thing as one highlight.
  */
@@ -200,7 +211,7 @@ class Ui {
           body.push(` ${marker}${num} ${painted}${bar[i] || ''}`);
         });
 
-        if (note) { body.push(''); body.push(' ' + note); }
+        if (note) pushNote(body, note);
 
         return chrome(screen, {
           title, crumb, right, body,
@@ -298,7 +309,7 @@ class Ui {
           body.push(` ${marker} ${box} ${painted}${bar[i] || ''}`);
         });
 
-        if (note) { body.push(''); body.push(' ' + note); }
+        if (note) pushNote(body, note);
 
         return chrome(screen, {
           title, crumb, right, body,
