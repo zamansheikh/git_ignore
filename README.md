@@ -405,6 +405,32 @@ All other files, diffs, messages, authors, and timestamps are preserved exactly.
 
 ---
 
+## Running it on a repo you have already filtered
+
+Perfectly fine — git-vanish handles it. Worth knowing what is going on
+underneath, though, because `git filter-repo` leaves a marker at
+`.git/filter-repo/already_ran` after every successful run, and more than a day
+later it wants to know whether the next run continues the previous one:
+
+```
+The previous run is older than a day (.git/filter-repo/already_ran already exists).
+Treat this run as a continuation of filtering in the previous run (Y/N)?
+```
+
+`--force` does not suppress that question. git-vanish settles it before
+invoking the tool, so you never see the prompt: it keeps the previous run's
+metadata when the metadata is complete, so `.git/filter-repo/commit-map` goes
+on mapping the SHAs your repository had before *any* filtering, and starts a
+fresh map when it is not. You will see one line saying which:
+
+```
+This repository has been filtered before — continuing that history.
+```
+
+The rewrite itself is identical either way; only the bookkeeping differs.
+
+---
+
 ## Requirements
 
 - Node.js ≥ 14

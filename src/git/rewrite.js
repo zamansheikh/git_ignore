@@ -25,6 +25,7 @@ const os   = require('os');
 const path = require('path');
 const fs   = require('fs');
 const chalk = require('chalk');
+const { runFilterRepo, hasFilterRepo } = require('./filterrepo');
 
 /* ─── helpers ──────────────────────────────────────────────── */
 
@@ -49,14 +50,6 @@ function run(cmd, cwd, { silent = false, failOk = false } = {}) {
     throw new Error(detail || `Command failed: ${cmd}`);
   }
   return res.stdout ? res.stdout.toString().trim() : '';
-}
-
-function cmdExists(name) {
-  try {
-    // shell:false — args go straight to the binary, so there is nothing to
-    // escape (shell:true + args is deprecated and injection-prone).
-    return spawnSync(name, ['--version'], { stdio: 'pipe' }).status === 0;
-  } catch { return false; }
 }
 
 /* ─── working tree backup / restore ───────────────────────── */
@@ -161,8 +154,8 @@ async function rewriteWithFilterRepo(repoPath, filePath, onProgress) {
   const gitPath = filePath.replace(/\\/g, '/').replace(/\/$/, '');
   // Captured, not inherited: this runs under a spinner, and filter-repo's
   // progress counters redraw over it. Failures still surface via the thrown
-  // error, which now carries both streams.
-  run(`git filter-repo --force --path "${gitPath}" --invert-paths`, repoPath, { silent: true });
+  // error, which carries a readable explanation.
+  runFilterRepo(repoPath, ['--force', '--path', gitPath, '--invert-paths'], { onProgress });
   onProgress('git filter-repo complete.');
 }
 
@@ -214,10 +207,11 @@ async function scrubFile(repoPath, filePath, onProgress = console.log) {
   // 1. Save working-tree content WITHOUT touching the git index
   const saved = saveContent(repoPath, filePath, onProgress);
 
-  // 2. Rewrite history
-  const hasFilterRepo = cmdExists('git-filter-repo');
+  // 2. Rewrite history. Detected the same way everywhere else in git-vanish —
+  // as a git subcommand, which is how filter-repo is normally installed.
+  const useFilterRepo = hasFilterRepo();
   try {
-    if (hasFilterRepo) {
+    if (useFilterRepo) {
       await rewriteWithFilterRepo(repoPath, filePath, onProgress);
     } else {
       await rewriteWithFilterBranch(repoPath, filePath, onProgress);
@@ -240,7 +234,7 @@ async function scrubFile(repoPath, filePath, onProgress = console.log) {
   }
 
   return {
-    method: hasFilterRepo ? 'filter-repo' : 'filter-branch',
+    method: useFilterRepo ? 'filter-repo' : 'filter-branch',
   };
 }
 

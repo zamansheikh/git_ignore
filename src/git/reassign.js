@@ -47,9 +47,7 @@ function run(cmd, cwd, { silent = false, failOk = false } = {}) {
   return res.stdout ? res.stdout.toString() : '';
 }
 
-function hasFilterRepo() {
-  return spawnSync('git', ['filter-repo', '--version'], { stdio: 'pipe' }).status === 0;
-}
+const { hasFilterRepo, runFilterRepo } = require('./filterrepo');
 
 /**
  * `Co-authored-by:` trailers, anywhere in a commit message.
@@ -374,7 +372,7 @@ async function reassignAuthors(repoPath, pairs, opts = {}, onProgress = console.
   const stamp = Date.now();
   const mailmapPath = path.join(os.tmpdir(), `git-vanish-mailmap-${stamp}.txt`);
   const messagePath = path.join(os.tmpdir(), `git-vanish-messages-${stamp}.txt`);
-  const args = ['git filter-repo --force'];
+  const argv = ['--force'];
 
   if (moves.length > 0) {
     fs.writeFileSync(
@@ -382,20 +380,20 @@ async function reassignAuthors(repoPath, pairs, opts = {}, onProgress = console.
       moves.map((m) => `${m.to.name} <${m.to.email}> <${m.from.email}>`).join('\n') + '\n',
       'utf8',
     );
-    args.push(`--mailmap "${mailmapPath}"`);
+    argv.push('--mailmap', mailmapPath);
   }
   if (rules.length > 0) {
     fs.writeFileSync(messagePath, rules.join('\n') + '\n', 'utf8');
-    args.push(`--replace-message "${messagePath}"`);
+    argv.push('--replace-message', messagePath);
   }
 
   try {
     onProgress(rules.length > 0
       ? 'Rewriting history with git filter-repo (identities and message trailers)…'
       : 'Rewriting history with git filter-repo --mailmap…');
-    // Captured rather than inherited: filter-repo interleaves progress counters
-    // with its own notices, and the useful part is the summary we print below.
-    run(args.join(' '), repoPath, { silent: true });
+    // Output is captured, not inherited: filter-repo interleaves progress
+    // counters with its own notices, and the useful part is the summary below.
+    runFilterRepo(repoPath, argv, { onProgress });
     onProgress('Rewrite complete.');
   } finally {
     for (const p of [mailmapPath, messagePath]) {

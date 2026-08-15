@@ -38,11 +38,7 @@ function run(cmd, cwd, { silent = false, failOk = false } = {}) {
   return res.stdout ? res.stdout.toString().trim() : '';
 }
 
-function hasFilterRepo() {
-  // shell:false — the args are passed straight to git, so nothing to escape.
-  const res = spawnSync('git', ['filter-repo', '--version'], { stdio: 'pipe' });
-  return res.status === 0;
-}
+const { hasFilterRepo, runFilterRepo } = require('./filterrepo');
 
 /**
  * Commits where the number of occurrences of the secret CHANGED (`git log -S`),
@@ -114,7 +110,7 @@ async function redactSecrets(repoPath, secrets, opts = {}, onProgress = console.
   try {
     onProgress('Rewriting history with git filter-repo --replace-text…');
     // --force: the repo is not a fresh clone (filter-repo's default safety check).
-    run(`git filter-repo --force --replace-text "${listPath}"`, repoPath);
+    runFilterRepo(repoPath, ['--force', '--replace-text', listPath], { onProgress });
     onProgress('Rewrite complete.');
   } finally {
     try { fs.unlinkSync(listPath); } catch {}
